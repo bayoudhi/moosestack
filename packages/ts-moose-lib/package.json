@@ -22,6 +22,11 @@
       "import": "./dist/browserCompatible.mjs",
       "require": "./dist/browserCompatible.js"
     },
+    "./serverless": {
+      "types": "./dist/serverless.d.ts",
+      "import": "./dist/serverless.mjs",
+      "require": "./dist/serverless.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -41,17 +46,10 @@
   "dependencies": {
     "@clickhouse/client": "1.8.1",
     "@clickhouse/client-web": "1.5.0",
-    "@temporalio/activity": "^1.11.7",
-    "@temporalio/client": "^1.11.7",
-    "@temporalio/common": "^1.11.7",
-    "@temporalio/worker": "^1.11.7",
-    "@temporalio/workflow": "^1.11.7",
     "commander": "^13.1.0",
     "csv-parse": "^5.5.5",
     "fastq": "1.17.1",
     "jose": "5.9.2",
-    "@514labs/kafka-javascript": "1.7.1-patch",
-    "@kafkajs/confluent-schema-registry": "3.9.0",
     "redis": "^4.6.13",
     "toml": "3.0.0",
     "ts-node": "^10.9.1",
@@ -72,7 +70,14 @@
   "peerDependencies": {
     "ts-patch": "^3.3.0",
     "tsconfig-paths": "^4.2.0",
-    "typia": "^9.6.1"
+    "typia": "^9.6.1",
+    "@514labs/kafka-javascript": "1.7.1-patch",
+    "@kafkajs/confluent-schema-registry": "^3.9.0",
+    "@temporalio/activity": "^1.11.7",
+    "@temporalio/client": "^1.11.7",
+    "@temporalio/common": "^1.11.7",
+    "@temporalio/worker": "^1.11.7",
+    "@temporalio/workflow": "^1.11.7"
   },
   "peerDependenciesMeta": {
     "ts-patch": {
@@ -83,6 +88,27 @@
     },
     "typia": {
       "optional": false
+    },
+    "@514labs/kafka-javascript": {
+      "optional": true
+    },
+    "@kafkajs/confluent-schema-registry": {
+      "optional": true
+    },
+    "@temporalio/activity": {
+      "optional": true
+    },
+    "@temporalio/client": {
+      "optional": true
+    },
+    "@temporalio/common": {
+      "optional": true
+    },
+    "@temporalio/worker": {
+      "optional": true
+    },
+    "@temporalio/workflow": {
+      "optional": true
     }
   }
 }

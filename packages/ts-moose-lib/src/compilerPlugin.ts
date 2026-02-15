@@ -1,15 +1,15 @@
 import ts, { factory } from "typescript";
+import { compilerLog } from "./commons-types";
 import {
   createTransformer,
   type TransformContext,
 } from "./compilerPluginHelper";
+import { isApiV2, transformApiV2 } from "./consumption-apis/typiaValidation";
 import {
   isNewMooseResourceWithTypeParam,
   transformNewMooseResource,
 } from "./dmv2/dataModelMetadata";
-import { isApiV2, transformApiV2 } from "./consumption-apis/typiaValidation";
 import { createTypiaContext } from "./typiaDirectIntegration";
-import { compilerLog } from "./commons";
 
 /**
  * Applies the appropriate transformation based on node type
