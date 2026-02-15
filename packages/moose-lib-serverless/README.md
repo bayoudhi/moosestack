@@ -83,7 +83,47 @@ const { OlapTable, Stream, sql } = require("@bayoudhi/moose-lib-serverless");
 import { OlapTable, Stream, sql } from "@bayoudhi/moose-lib-serverless";
 ```
 
-> **Note**: The CJS bundle is recommended for AWS Lambda because ESM top-level imports cannot be lazily deferred. The CJS bundle keeps the Kafka reference inside a lazy `__esm` block that never executes unless you explicitly call `getClickhouseClient()` or `getKafkaProducer()`.
+ > **Note**: The CJS bundle is recommended for AWS Lambda because ESM top-level imports cannot be lazily deferred. The CJS bundle keeps the Kafka reference inside a lazy `__esm` block that never executes unless you explicitly call `getClickhouseClient()` or `getKafkaProducer()`.
+
+## ClickHouse Configuration for Serverless
+
+In a standard Moose project, ClickHouse connection details are read from `moose.config.toml`. This file doesn't exist in serverless environments, so calling `OlapTable.insert()` would throw a `ConfigError`.
+
+Use `configureClickHouse()` to provide connection details programmatically. Call it **once** during cold start, before any `.insert()` calls:
+
+```typescript
+import { configureClickHouse, OlapTable } from "@bayoudhi/moose-lib-serverless";
+
+// Call once at module level (runs during Lambda cold start)
+configureClickHouse({
+  host: process.env.CLICKHOUSE_HOST!,
+  port: process.env.CLICKHOUSE_PORT!,       // string, e.g. "8443"
+  username: process.env.CLICKHOUSE_USER!,
+  password: process.env.CLICKHOUSE_PASSWORD!,
+  database: process.env.CLICKHOUSE_DATABASE!,
+  useSSL: true,
+});
+
+// Define your table (compiler plugin injects schema at build time)
+const myTable = new OlapTable<MyType>("my_table");
+
+export async function handler(event: any) {
+  const data = parseEvent(event);
+  await myTable.insert(data);  // Works without moose.config.toml
+  return { statusCode: 200 };
+}
+```
+
+### `ClickHouseConfig` fields
+
+| Field | Type | Example |
+| --- | --- | --- |
+| `host` | `string` | `"clickhouse.example.com"` |
+| `port` | `string` | `"8443"` |
+| `username` | `string` | `"default"` |
+| `password` | `string` | `"secret"` |
+| `database` | `string` | `"my_database"` |
+| `useSSL` | `boolean` | `true` |
 
 ## What's Included
 
@@ -98,6 +138,8 @@ import { OlapTable, Stream, sql } from "@bayoudhi/moose-lib-serverless";
 | ClickHouse column types | `Columns.String`, `Columns.Int32`, `Columns.DateTime`, etc. |
 | `ConsumptionUtil`, `ApiUtil` | Utility types for consumption APIs |
 | `registerDataSource` | Register external data source connectors |
+| `configureClickHouse` | Provide ClickHouse connection config for serverless (no `moose.config.toml`) |
+| `ClickHouseConfig` | TypeScript interface for `configureClickHouse()` options |
 | `getSecrets` | Retrieve secrets from the Moose secrets store |
 | Utility functions | `compilerLog`, `cliLog`, `mapTstoJs`, `getFileName`, etc. |
 
