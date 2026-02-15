@@ -10,6 +10,63 @@ This package re-exports the pure-TypeScript surface of the Moose SDK — OlapTab
 npm install @bayoudhi/moose-lib-serverless
 ```
 
+If you use `OlapTable<T>`, `Stream<T>`, or other generic Moose resources that require compile-time schema injection, you also need the compiler plugin dependencies:
+
+```bash
+npm install -D ts-patch typia typescript
+```
+
+## Compiler Plugin Setup
+
+The Moose compiler plugin transforms generic resource declarations like `new OlapTable<MyType>(...)` at compile time, injecting JSON schemas, column definitions, and runtime validators. Without it, you'll get:
+
+```
+Supply the type param T so that the schema is inserted by the compiler plugin.
+```
+
+### 1. Configure `tsconfig.json`
+
+Add the compiler plugin and typia transform to your `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "plugins": [
+      {
+        "transform": "@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js"
+      },
+      {
+        "transform": "typia/lib/transform"
+      }
+    ]
+  }
+}
+```
+
+### 2. Install ts-patch
+
+```bash
+npx ts-patch install
+```
+
+### 3. Build with `tspc` instead of `tsc`
+
+```bash
+npx tspc
+```
+
+Or add it to your `package.json` scripts:
+
+```json
+{
+  "scripts": {
+    "build": "tspc"
+  }
+}
+```
+
+> **Note**: `tspc` is a drop-in replacement for `tsc` that loads the compiler plugins defined in `tsconfig.json`. Standard `tsc` ignores the `plugins` array.
+
 ## Usage
 
 ### CommonJS (recommended for Lambda)

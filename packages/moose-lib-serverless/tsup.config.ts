@@ -1,5 +1,7 @@
 import type { Plugin } from "esbuild";
-import { defineConfig } from "tsup";
+import { readFileSync } from "fs";
+import { resolve } from "path";
+import { defineConfig, type Options } from "tsup";
 
 /**
  * esbuild plugin that replaces native/heavy dependencies with empty stubs.
@@ -77,7 +79,46 @@ const stubNativeModules: Plugin = {
   },
 };
 
-export default defineConfig({
+/**
+ * esbuild plugin that loads the upstream compiler plugin and patches isMooseFile()
+ * to also recognize @bayoudhi/moose-lib-serverless import paths.
+ *
+ * The upstream compiler plugin only transforms `new OlapTable<T>(...)` when the
+ * constructor's declaration file is in a path containing "@514labs/moose-lib".
+ * This patch adds "@bayoudhi/moose-lib-serverless" to that check.
+ */
+const patchedCompilerPlugin: Plugin = {
+  name: "patched-compiler-plugin",
+  setup(build) {
+    // Intercept our stub compilerPlugin.ts and replace it with the patched upstream
+    build.onLoad(
+      { filter: /moose-lib-serverless\/src\/compilerPlugin\.ts$/ },
+      () => {
+        // Read the upstream compiled compiler plugin
+        const upstreamPath = resolve(
+          __dirname,
+          "node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
+        );
+        let contents = readFileSync(upstreamPath, "utf8");
+
+        // Patch isMooseFile to recognize our package
+        contents = contents.replace(
+          'location.includes("@514labs/moose-lib")',
+          'location.includes("@514labs/moose-lib") || location.includes("@bayoudhi/moose-lib-serverless")',
+        );
+
+        return { contents, loader: "js" };
+      },
+    );
+  },
+};
+
+// ─── Build Configurations ───────────────────────────────────────────────────
+
+/**
+ * Main library build: serverless-compatible SDK classes and utilities.
+ */
+const libraryConfig: Options = {
   entry: ["src/index.ts"],
   format: ["cjs", "esm"],
   dts: true,
@@ -108,4 +149,63 @@ export default defineConfig({
 
   // Stub out native modules so they never crash at load time.
   esbuildPlugins: [stubNativeModules],
-});
+};
+
+/**
+ * Compiler plugin build: patched version of the Moose compiler plugin.
+ *
+ * This is loaded by ts-patch at compile time (not at Lambda runtime), so:
+ * - CJS only (ts-patch uses require())
+ * - No .d.ts needed (consumers reference it by file path in tsconfig.json)
+ * - typescript, ts-patch, and typia are external (peer deps at compile time)
+ * - All other deps from moose-lib are already inlined in the upstream bundle
+ */
+const compilerPluginConfig: Options = {
+  entry: ["src/compilerPlugin.ts"],
+  format: ["cjs"],
+  dts: false,
+  outDir: "dist",
+  splitting: false,
+  sourcemap: false,
+  // Don't clean — the library build already cleaned the output dir.
+  clean: false,
+
+  // The upstream compiler plugin is already a self-contained bundle.
+  // Our esbuild plugin loads and patches it directly, so we don't need
+  // noExternal here. We just need to make sure we don't try to resolve
+  // any of its external dependencies.
+  external: [
+    "typescript",
+    "ts-patch",
+
+    // Typia internals — the plugin calls these directly at compile time
+    "typia",
+    "typia/lib/programmers/*",
+    "typia/lib/factories/*",
+    "typia/lib/transformers/*",
+    "typia/lib/schemas/*",
+    "typia/lib/tags",
+
+    // ClickHouse client — pulled in transitively via commons.ts but never
+    // called by the compiler plugin. Mark external so the require() is
+    // preserved but never resolves unless installed.
+    "@clickhouse/client",
+    "@clickhouse/client-web",
+
+    // Other transitive deps from the upstream bundle
+    "csv-parse",
+    "jose",
+    "toml",
+
+    // Node builtins
+    "fs",
+    "path",
+    "process",
+    "node:fs",
+    "node:stream",
+  ],
+
+  esbuildPlugins: [patchedCompilerPlugin, stubNativeModules],
+};
+
+export default defineConfig([libraryConfig, compilerPluginConfig]);
