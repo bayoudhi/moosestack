@@ -33,7 +33,7 @@ Add the compiler plugin and typia transform to your `tsconfig.json`:
   "compilerOptions": {
     "plugins": [
       {
-        "transform": "@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js"
+        "transform": "@bayoudhi/moose-lib-serverless/compilerPlugin"
       },
       {
         "transform": "typia/lib/transform"
@@ -42,6 +42,8 @@ Add the compiler plugin and typia transform to your `tsconfig.json`:
   }
 }
 ```
+
+Both `@bayoudhi/moose-lib-serverless/compilerPlugin` and `@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js` work — use whichever you prefer.
 
 ### 2. Install ts-patch
 
