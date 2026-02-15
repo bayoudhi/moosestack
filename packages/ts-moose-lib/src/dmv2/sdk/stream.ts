@@ -10,19 +10,19 @@
  * @module Stream
  */
 
-import { createHash } from "node:crypto";
-import type { IJsonSchemaCollection } from "typia";
-import type { Logger, Producer } from "../../commons-types";
-import type {
-  ConfigurationRegistry,
-  RuntimeKafkaConfig,
-} from "../../config/runtime";
-import type { Column } from "../../dataModels/dataModelTypes";
-import { dlqColumns, dlqSchema, getMooseInternal } from "../internal";
+import { IJsonSchemaCollection } from "typia";
 import { TypedBase } from "../typedBase";
+import { Column } from "../../dataModels/dataModelTypes";
+import { dlqColumns, dlqSchema, getMooseInternal } from "../internal";
+import { OlapTable } from "./olapTable";
+import { LifeCycle } from "./lifeCycle";
+import type {
+  RuntimeKafkaConfig,
+  ConfigurationRegistry,
+} from "../../config/runtime";
+import { createHash } from "node:crypto";
+import { Logger, Producer } from "../../commons";
 import { getSourceFileFromStack } from "../utils/stackTrace";
-import type { LifeCycle } from "./lifeCycle";
-import type { OlapTable } from "./olapTable";
 
 /**
  * Represents zero, one, or many values of type T.
@@ -284,10 +284,10 @@ export class Stream<T> extends TypedBase<T, StreamConfig<T>> {
    *
    * @internal
    */
-  _consumers = [] as {
+  _consumers = new Array<{
     consumer: Consumer<T>;
     config: ConsumerConfig<T>;
-  }[];
+  }>();
 
   /**
    * Builds the full Kafka topic name including optional namespace and version suffix.
@@ -428,7 +428,7 @@ export class Stream<T> extends TypedBase<T, StreamConfig<T>> {
       } = await import("@kafkajs/confluent-schema-registry");
       const registry = new SchemaRegistry({ host: schemaRegistryUrl });
 
-      let schemaId: undefined | number;
+      let schemaId: undefined | number = undefined;
 
       if ("id" in sr.reference) {
         schemaId = sr.reference.id;

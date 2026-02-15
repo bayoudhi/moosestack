@@ -11,43 +11,41 @@
  * @internal This module is intended for internal use by the Moose library and compiler plugin.
  *           Its API might change without notice.
  */
-
+import process from "process";
 import * as fs from "fs";
 import * as path from "path";
-import process from "process";
-import type { IJsonSchemaCollection } from "typia/src/schemas/json/IJsonSchemaCollection";
-import { compilerLog } from "../commons-types";
+import { Api, IngestApi, SqlResource, Task, Workflow } from "./index";
+import { IJsonSchemaCollection } from "typia/src/schemas/json/IJsonSchemaCollection";
+import { Column } from "../dataModels/dataModelTypes";
+import { ClickHouseEngines, ApiUtil } from "../index";
 import {
-  getSourceDir,
-  loadModule,
-  shouldUseCompiled,
-} from "../compiler-config";
-import type { ApiUtil } from "../consumption-apis/helpers";
-import type { Column } from "../dataModels/dataModelTypes";
-import { ClickHouseEngines } from "../dataModels/types";
-import type { Api, IngestApi, SqlResource, Task, Workflow } from "./index";
-import type { MaterializedView } from "./sdk/materializedView";
-import type {
-  OlapConfig,
   OlapTable,
+  OlapConfig,
   ReplacingMergeTreeConfig,
-  ReplicatedAggregatingMergeTreeConfig,
-  ReplicatedCollapsingMergeTreeConfig,
+  SummingMergeTreeConfig,
   ReplicatedMergeTreeConfig,
   ReplicatedReplacingMergeTreeConfig,
+  ReplicatedAggregatingMergeTreeConfig,
   ReplicatedSummingMergeTreeConfig,
+  ReplicatedCollapsingMergeTreeConfig,
   ReplicatedVersionedCollapsingMergeTreeConfig,
   S3QueueConfig,
-  SummingMergeTreeConfig,
 } from "./sdk/olapTable";
-import type {
+import {
   ConsumerConfig,
   KafkaSchemaConfig,
   Stream,
   TransformConfig,
 } from "./sdk/stream";
-import type { View } from "./sdk/view";
-import type { WebApp } from "./sdk/webApp";
+import { compilerLog } from "../commons";
+import { WebApp } from "./sdk/webApp";
+import { MaterializedView } from "./sdk/materializedView";
+import { View } from "./sdk/view";
+import {
+  getSourceDir,
+  shouldUseCompiled,
+  loadModule,
+} from "../compiler-config";
 
 /**
  * Recursively finds all TypeScript/JavaScript files in a directory
@@ -941,7 +939,7 @@ export const toInfraMap = (registry: typeof moose_internal) => {
       convertTableConfigToEngineConfig(table.config);
 
     // Get table settings, applying defaults for S3Queue
-    let tableSettings: { [key: string]: string } | undefined;
+    let tableSettings: { [key: string]: string } | undefined = undefined;
 
     if (table.config.settings) {
       // Convert all settings to strings, filtering out undefined values

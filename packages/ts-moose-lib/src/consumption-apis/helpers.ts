@@ -1,26 +1,16 @@
-import { createHash, randomUUID } from "node:crypto";
-import type {
-  ClickHouseClient,
-  CommandResult,
-  ResultSet,
-} from "@clickhouse/client";
+import { ClickHouseClient, CommandResult, ResultSet } from "@clickhouse/client";
 import {
-  Connection,
-  type ConnectionOptions,
   Client as TemporalClient,
+  Connection,
+  ConnectionOptions,
 } from "@temporalio/client";
-import type { StringValue } from "@temporalio/common";
-import * as fs from "fs";
-import type { JWTPayload } from "jose";
+import { StringValue } from "@temporalio/common";
+import { createHash, randomUUID } from "node:crypto";
 import { performance } from "perf_hooks";
+import * as fs from "fs";
 import { getWorkflows } from "../dmv2/internal";
-import {
-  type RawValue,
-  Sql,
-  type sql,
-  toQuery,
-  toQueryPreview,
-} from "../sqlHelpers";
+import { JWTPayload } from "jose";
+import { Sql, sql, RawValue, toQuery, toQueryPreview } from "../sqlHelpers";
 
 /**
  * Format elapsed milliseconds into a human-readable string.
@@ -245,7 +235,7 @@ export async function getTemporalClient(
       `<api> Using temporal_url: ${temporalUrl} and namespace: ${namespace}`,
     );
 
-    const connectionOptions: ConnectionOptions = {
+    let connectionOptions: ConnectionOptions = {
       address: temporalUrl,
       connectTimeout: "3s",
     };
