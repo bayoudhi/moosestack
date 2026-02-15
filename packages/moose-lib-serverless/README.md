@@ -116,7 +116,7 @@ These native/C++ dependencies are **not** bundled and will never be loaded:
 This package is derived from [MooseStack](https://github.com/514-labs/moosestack) by [Fiveonefour Labs](https://www.fiveonefour.com/), published under the MIT license.
 
 - **Original project**: https://github.com/514-labs/moosestack
-- **Fork**: https://github.com/bayoudhi/moosestack (branch `feature/serverless-compatibility`)
+- **Fork**: https://github.com/bayoudhi/moosestack
 
 ## License
 
