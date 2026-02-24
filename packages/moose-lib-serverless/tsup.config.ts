@@ -113,6 +113,43 @@ const patchedCompilerPlugin: Plugin = {
   },
 };
 
+/**
+ * esbuild plugin that loads the upstream moose-tspc binary and patches the
+ * compiler plugin path to reference @bayoudhi/moose-lib-serverless.
+ *
+ * The upstream moose-tspc.js creates a temporary tsconfig with the Moose compiler
+ * plugins and runs tspc. It hardcodes the plugin path as:
+ *   ./node_modules/@514labs/moose-lib/dist/compilerPlugin.js
+ *
+ * This patch rewrites that to use our package's compiler plugin instead.
+ */
+const patchedMooseTspc: Plugin = {
+  name: "patched-moose-tspc",
+  setup(build) {
+    build.onLoad(
+      { filter: /moose-lib-serverless\/src\/moose-tspc\.ts$/ },
+      () => {
+        const upstreamPath = resolve(
+          __dirname,
+          "node_modules/@514labs/moose-lib/dist/moose-tspc.js",
+        );
+        let contents = readFileSync(upstreamPath, "utf8");
+
+        // Strip the upstream shebang — tsup's banner config adds our own
+        contents = contents.replace(/^#!.*\n/, "");
+
+        // Patch the compiler plugin path to use our package
+        contents = contents.replace(
+          "./node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
+          "./node_modules/@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js",
+        );
+
+        return { contents, loader: "js" };
+      },
+    );
+  },
+};
+
 // ─── Build Configurations ───────────────────────────────────────────────────
 
 /**
@@ -208,4 +245,44 @@ const compilerPluginConfig: Options = {
   esbuildPlugins: [patchedCompilerPlugin, stubNativeModules],
 };
 
-export default defineConfig([libraryConfig, compilerPluginConfig]);
+/**
+ * moose-tspc binary build: patched version of the Moose TypeScript compiler.
+ *
+ * This binary is invoked by the moose CLI (e.g. `moose generate migration`)
+ * to compile TypeScript models with the Moose compiler plugins.
+ *
+ * - CJS only (it's a Node.js CLI script)
+ * - No .d.ts needed (consumers invoke it as a binary, not import it)
+ * - Native modules are stubbed (Kafka is pulled in via commons.ts but unused)
+ */
+const mooseTspcConfig: Options = {
+  entry: ["src/moose-tspc.ts"],
+  format: ["cjs"],
+  dts: false,
+  outDir: "dist",
+  splitting: false,
+  sourcemap: false,
+  // Don't clean — the library build already cleaned the output dir.
+  clean: false,
+
+  external: [
+    // Node builtins used by moose-tspc
+    "child_process",
+    "fs",
+    "path",
+    "process",
+  ],
+
+  esbuildPlugins: [patchedMooseTspc, stubNativeModules],
+
+  // Preserve the shebang for CLI execution
+  banner: {
+    js: "#!/usr/bin/env node",
+  },
+};
+
+export default defineConfig([
+  libraryConfig,
+  compilerPluginConfig,
+  mooseTspcConfig,
+]);

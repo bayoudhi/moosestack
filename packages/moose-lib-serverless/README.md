@@ -153,6 +153,14 @@ These native/C++ dependencies are **not** bundled and will never be loaded:
 | `@temporalio/client` | Native Rust bridge; not available in serverless |
 | `redis` | TCP connection pooling incompatible with short-lived functions |
 
+
+## Moose CLI Compatibility
+
+This package ships a patched `moose-tspc` binary, so Moose CLI commands like `moose generate migration` and `moose migrate` work without needing `@514labs/moose-lib` installed.
+
+When you install `@bayoudhi/moose-lib-serverless`, `moose-tspc` is automatically placed in `node_modules/.bin/`. The Moose CLI finds it there and uses it to compile your TypeScript models with the correct compiler plugins.
+
+No extra configuration is needed beyond the standard [Compiler Plugin Setup](#compiler-plugin-setup) above.
 ## Origin
 
 This package is derived from [MooseStack](https://github.com/514-labs/moosestack) by [Fiveonefour Labs](https://www.fiveonefour.com/), published under the MIT license.
