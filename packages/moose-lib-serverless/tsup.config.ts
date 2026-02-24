@@ -145,10 +145,11 @@ const patchedMooseTspc: Plugin = {
         // Strip the upstream shebang — tsup's banner config adds our own
         contents = contents.replace(/^#!.*\n/, "");
 
-        // Patch the compiler plugin path to use our package
+        // Patch the compiler plugin path to use require.resolve() so it works
+        // in monorepos with hoisted node_modules (where ./node_modules/... fails)
         contents = contents.replace(
-          "./node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
-          "./node_modules/@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js",
+          '"./node_modules/@514labs/moose-lib/dist/compilerPlugin.js"',
+          'require.resolve("@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js")',
         );
 
         return { contents, loader: "js" };
@@ -194,10 +195,11 @@ const patchedMooseRunner: Plugin = {
         // Strip the upstream shebang — tsup's banner config adds our own
         contents = contents.replace(/^#!.*\n/, "");
 
-        // Patch the compiler plugin path to use our package
+        // Patch the compiler plugin path to use require.resolve() so it works
+        // in monorepos with hoisted node_modules (where ./node_modules/... fails)
         contents = contents.replace(
-          "./node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
-          "./node_modules/@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js",
+          '"./node_modules/@514labs/moose-lib/dist/compilerPlugin.js"',
+          'require.resolve("@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js")',
         );
 
         // Patch the version reading to return the upstream moose-lib version
