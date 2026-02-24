@@ -149,6 +149,43 @@ const patchedMooseTspc: Plugin = {
     );
   },
 };
+/**
+ * esbuild plugin that loads the upstream moose-runner binary and patches the
+ * compiler plugin path to reference @bayoudhi/moose-lib-serverless.
+ *
+ * moose-runner is invoked by the moose CLI to serialize data models, run
+ * consumption APIs, streaming functions, and scripts. The upstream version
+ * hardcodes the compiler plugin path as:
+ *   ./node_modules/@514labs/moose-lib/dist/compilerPlugin.js
+ *
+ * This patch rewrites that to use our package's compiler plugin instead.
+ */
+const patchedMooseRunner: Plugin = {
+  name: "patched-moose-runner",
+  setup(build) {
+    build.onLoad(
+      { filter: /moose-lib-serverless\/src\/moose-runner\.ts$/ },
+      () => {
+        const upstreamPath = resolve(
+          __dirname,
+          "node_modules/@514labs/moose-lib/dist/moose-runner.js",
+        );
+        let contents = readFileSync(upstreamPath, "utf8");
+
+        // Strip the upstream shebang — tsup's banner config adds our own
+        contents = contents.replace(/^#!.*\n/, "");
+
+        // Patch the compiler plugin path to use our package
+        contents = contents.replace(
+          "./node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
+          "./node_modules/@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js",
+        );
+
+        return { contents, loader: "js" };
+      },
+    );
+  },
+};
 
 // ─── Build Configurations ───────────────────────────────────────────────────
 
@@ -281,8 +318,67 @@ const mooseTspcConfig: Options = {
   },
 };
 
+/**
+ * moose-runner binary build: patched version of the Moose runner.
+ *
+ * This binary is invoked by the moose CLI to serialize data models,
+ * run consumption APIs, streaming functions, and scripts.
+ *
+ * - CJS only (it's a Node.js CLI script)
+ * - No .d.ts needed (consumers invoke it as a binary, not import it)
+ * - Native modules are stubbed (Kafka, Temporal, Redis are unused in CI)
+ * - Runtime deps (commander, ts-node, etc.) are externalized
+ */
+const mooseRunnerConfig: Options = {
+  entry: ["src/moose-runner.ts"],
+  format: ["cjs"],
+  dts: false,
+  outDir: "dist",
+  splitting: false,
+  sourcemap: false,
+  // Don't clean — the library build already cleaned the output dir.
+  clean: false,
+
+  external: [
+    // Runtime deps that moose-runner needs (installed transitively)
+    "@clickhouse/client",
+    "@clickhouse/client-web",
+    "commander",
+    "csv-parse",
+    "jose",
+    "toml",
+    "ts-node",
+    "tsconfig-paths",
+    "ts-patch",
+    "typescript",
+
+    // Node builtins
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "crypto",
+    "fs",
+    "http",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "stream",
+    "util",
+  ],
+
+  esbuildPlugins: [patchedMooseRunner, stubNativeModules],
+
+  // Preserve the shebang for CLI execution
+  banner: {
+    js: "#!/usr/bin/env node",
+  },
+};
+
 export default defineConfig([
   libraryConfig,
   compilerPluginConfig,
   mooseTspcConfig,
+  mooseRunnerConfig,
 ]);

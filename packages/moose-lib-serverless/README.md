@@ -158,7 +158,7 @@ These native/C++ dependencies are **not** bundled and will never be loaded:
 
 This package includes the full **Moose CLI** (`@514labs/moose-cli`) as a dependency, so commands like `moose generate migration` and `moose migrate` work out of the box — no separate CLI installation needed.
 
-It also ships a patched `moose-tspc` binary that rewires the compiler plugin path to `@bayoudhi/moose-lib-serverless`, so the Moose CLI can compile your TypeScript models without `@514labs/moose-lib` installed.
+It also ships patched `moose-tspc` and `moose-runner` binaries that rewire internal paths to `@bayoudhi/moose-lib-serverless`, so the Moose CLI can compile and serialize your TypeScript models without `@514labs/moose-lib` installed.
 
 ### CI/CD Usage
 
@@ -170,7 +170,7 @@ steps:
   - run: npx moose migrate
 ```
 
-Both `moose` and `moose-tspc` are automatically available in `node_modules/.bin/` after `npm install`.
+All three binaries (`moose`, `moose-tspc`, `moose-runner`) are automatically available in `node_modules/.bin/` after `npm install`.
 
 No extra configuration is needed beyond the standard [Compiler Plugin Setup](#compiler-plugin-setup) above.
 
