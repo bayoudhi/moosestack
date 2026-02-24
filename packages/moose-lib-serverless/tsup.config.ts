@@ -150,15 +150,18 @@ const patchedMooseTspc: Plugin = {
   },
 };
 /**
- * esbuild plugin that loads the upstream moose-runner binary and patches the
- * compiler plugin path to reference @bayoudhi/moose-lib-serverless.
+ * esbuild plugin that loads the upstream moose-runner binary and patches:
+ * 1. The compiler plugin path to reference @bayoudhi/moose-lib-serverless
+ * 2. The version reported by `print-version` to match the upstream moose-lib version
  *
  * moose-runner is invoked by the moose CLI to serialize data models, run
  * consumption APIs, streaming functions, and scripts. The upstream version
  * hardcodes the compiler plugin path as:
  *   ./node_modules/@514labs/moose-lib/dist/compilerPlugin.js
  *
- * This patch rewrites that to use our package's compiler plugin instead.
+ * The CLI's version check (added in v0.6.417) runs `moose-runner print-version`
+ * and compares the output to CLI_VERSION. Our moose-runner must report the
+ * upstream version (not our package version) to pass this check.
  */
 const patchedMooseRunner: Plugin = {
   name: "patched-moose-runner",
@@ -172,6 +175,15 @@ const patchedMooseRunner: Plugin = {
         );
         let contents = readFileSync(upstreamPath, "utf8");
 
+        // Read the upstream moose-lib version for the print-version command
+        const upstreamPkgPath = resolve(
+          __dirname,
+          "node_modules/@514labs/moose-lib/package.json",
+        );
+        const upstreamVersion = JSON.parse(
+          readFileSync(upstreamPkgPath, "utf8"),
+        ).version;
+
         // Strip the upstream shebang — tsup's banner config adds our own
         contents = contents.replace(/^#!.*\n/, "");
 
@@ -179,6 +191,14 @@ const patchedMooseRunner: Plugin = {
         contents = contents.replace(
           "./node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
           "./node_modules/@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js",
+        );
+
+        // Patch the version reading to return the upstream moose-lib version
+        // instead of reading our package.json (which has a different version).
+        // The CLI compares this output to its own version (CLI_VERSION).
+        contents = contents.replace(
+          /var packageJson = JSON\.parse\(\n\s*\(0, import_fs2\.readFileSync\)\(\(0, import_path2\.join\)\(__dirname, "\.\.", "package\.json"\), "utf-8"\)\n\);/,
+          `var packageJson = { version: "${upstreamVersion}" };`,
         );
 
         return { contents, loader: "js" };
@@ -195,7 +215,7 @@ const patchedMooseRunner: Plugin = {
 const libraryConfig: Options = {
   entry: ["src/index.ts"],
   format: ["cjs", "esm"],
-  dts: true,
+  dts: { resolve: ["@514labs/moose-lib"] },
   outDir: "dist",
   splitting: false,
   sourcemap: true,
