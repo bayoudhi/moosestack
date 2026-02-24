@@ -160,7 +160,7 @@ const patchedMooseTspc: Plugin = {
 /**
  * esbuild plugin that loads the upstream moose-runner binary and patches:
  * 1. The compiler plugin path to reference @bayoudhi/moose-lib-serverless
- * 2. The version reported by `print-version` to match the upstream moose-lib version
+ * 2. The print-version command to detect the installed CLI version at runtime
  *
  * moose-runner is invoked by the moose CLI to serialize data models, run
  * consumption APIs, streaming functions, and scripts. The upstream version
@@ -168,8 +168,10 @@ const patchedMooseTspc: Plugin = {
  *   ./node_modules/@514labs/moose-lib/dist/compilerPlugin.js
  *
  * The CLI's version check (added in v0.6.417) runs `moose-runner print-version`
- * and compares the output to CLI_VERSION. Our moose-runner must report the
- * upstream version (not our package version) to pass this check.
+ * and compares the output to CLI_VERSION (strict equality). Rather than
+ * hardcoding a specific version, we patch the print-version action to detect
+ * the installed CLI version at runtime via `moose --version`. This decouples
+ * moose-lib-serverless releases from CLI version bumps.
  */
 const patchedMooseRunner: Plugin = {
   name: "patched-moose-runner",
@@ -183,7 +185,15 @@ const patchedMooseRunner: Plugin = {
         );
         let contents = readFileSync(upstreamPath, "utf8");
 
-        // Read the upstream moose-lib version for the print-version command
+        // Strip the upstream shebang — tsup's banner config adds our own
+        contents = contents.replace(/^#!.*\n/, "");
+
+        // Patch the print-version command to detect the installed CLI version
+        // at runtime instead of reading a hardcoded package.json version.
+        // The CLI runs `moose-runner print-version` and does a strict equality
+        // check against its own CLI_VERSION. By running `moose --version` and
+        // echoing the result, we always match whatever CLI is installed.
+        // Falls back to the upstream moose-lib version if detection fails.
         const upstreamPkgPath = resolve(
           __dirname,
           "node_modules/@514labs/moose-lib/package.json",
@@ -192,22 +202,27 @@ const patchedMooseRunner: Plugin = {
           readFileSync(upstreamPkgPath, "utf8"),
         ).version;
 
-        // Strip the upstream shebang — tsup's banner config adds our own
-        contents = contents.replace(/^#!.*\n/, "");
-
-        // Patch the compiler plugin path to use require.resolve() so it works
-        // in monorepos with hoisted node_modules (where ./node_modules/... fails)
-        contents = contents.replace(
-          '"./node_modules/@514labs/moose-lib/dist/compilerPlugin.js"',
-          'require.resolve("@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js")',
-        );
-
-        // Patch the version reading to return the upstream moose-lib version
-        // instead of reading our package.json (which has a different version).
-        // The CLI compares this output to its own version (CLI_VERSION).
         contents = contents.replace(
           /var packageJson = JSON\.parse\(\n\s*\(0, import_fs2\.readFileSync\)\(\(0, import_path2\.join\)\(__dirname, "\.\.", "package\.json"\), "utf-8"\)\n\);/,
           `var packageJson = { version: "${upstreamVersion}" };`,
+        );
+
+        // Replace the print-version action to detect CLI version at runtime.
+        // Original: process.stdout.write(packageJson.version);
+        // Patched: try `moose --version`, parse output, echo that version.
+        contents = contents.replace(
+          "process.stdout.write(packageJson.version)",
+          [
+            "(function() {",
+            "  try {",
+            '    var out = require("child_process").execSync("moose --version", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();',
+            "    var match = out.match(/moose-cli\\s+(\\S+)/);",
+            "    process.stdout.write(match ? match[1] : packageJson.version);",
+            "  } catch(e) {",
+            "    process.stdout.write(packageJson.version);",
+            "  }",
+            "})()",
+          ].join("\n"),
         );
 
         // resolveDir tells esbuild where to resolve bare require() calls
