@@ -1,6 +1,6 @@
 {
   "name": "@bayoudhi/moose-lib-serverless",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Serverless-compatible subset of @514labs/moose-lib for AWS Lambda and edge runtimes. Provides OlapTable, Stream, Workflow, View, and other Moose SDK classes without native C++ dependencies (Kafka, Temporal). Includes a patched compiler plugin for type-driven schema injection.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -54,25 +54,20 @@
     "csv-parse": "^5.5.5",
     "jose": "5.9.2",
     "toml": "3.0.0",
-    "ts-node": "^10.9.1"
+    "ts-node": "^10.9.1",
+    "ts-patch": "^3.3.0",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "~5.9.2"
   },
   "devDependencies": {
     "@514labs/moose-lib": "workspace:*",
     "tsup": "^8.4.0"
   },
   "peerDependencies": {
-    "typia": "^9.6.1",
-    "typescript": ">=5.0.0",
-    "ts-patch": "^3.3.0"
+    "typia": "^9.6.1"
   },
   "peerDependenciesMeta": {
     "typia": {
-      "optional": true
-    },
-    "typescript": {
-      "optional": true
-    },
-    "ts-patch": {
       "optional": true
     }
   },
