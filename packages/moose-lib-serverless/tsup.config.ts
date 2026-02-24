@@ -210,7 +210,17 @@ const patchedMooseRunner: Plugin = {
           `var packageJson = { version: "${upstreamVersion}" };`,
         );
 
-        return { contents, loader: "js" };
+        // resolveDir tells esbuild where to resolve bare require() calls
+        // found in the upstream content. Without it, esbuild can't resolve
+        // imports like commander from the virtual onLoad content.
+        return {
+          contents,
+          loader: "js",
+          resolveDir: resolve(
+            __dirname,
+            "node_modules/@514labs/moose-lib/dist",
+          ),
+        };
       },
     );
   },
@@ -525,11 +535,16 @@ const mooseRunnerConfig: Options = {
   // Don't clean — the library build already cleaned the output dir.
   clean: false,
 
+  // Override tsup's auto-externalization for commander. tsup auto-externalizes
+  // all packages in dependencies, but commander must be bundled because
+  // consumers may hoist an incompatible version (e.g. commander@2 from CDK).
+  // Commander v13's .argument() method is required by the upstream moose-runner.
+  noExternal: ["commander"],
+
   external: [
     // Runtime deps that moose-runner needs (installed transitively)
     "@clickhouse/client",
     "@clickhouse/client-web",
-    "commander",
     "csv-parse",
     "jose",
     "toml",
