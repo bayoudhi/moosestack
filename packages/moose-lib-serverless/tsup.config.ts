@@ -1,6 +1,13 @@
 import type { Plugin } from "esbuild";
-import { readFileSync } from "fs";
-import { resolve } from "path";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "fs";
+import { resolve, basename, join } from "path";
 import { defineConfig, type Options } from "tsup";
 
 /**
@@ -207,6 +214,153 @@ const patchedMooseRunner: Plugin = {
   },
 };
 
+/**
+ * Copy upstream .d.ts files into our dist/ and create self-contained type
+ * declarations. This replaces tsup's broken DTS generation which fails to
+ * inline chunked type files from the upstream npm package.
+ *
+ * The upstream @514labs/moose-lib/dist/ has chunked types:
+ *   index.d.ts          → re-exports from ./index-DdE-_e4q.js and ./browserCompatible.js
+ *   index-DdE-_e4q.d.ts → main chunk with all type declarations (OlapTable, Stream, etc.)
+ *   browserCompatible.d.ts → subset re-exporting Key, JWT from the chunk
+ *
+ * We copy the chunk files as-is, then create our own index.d.ts that:
+ * 1. Rewrites .js references to .d.ts so TypeScript resolves them locally
+ * 2. Removes the @514labs/kafka-javascript import (native dep not installed)
+ * 3. Stubs the Kafka and Producer types that reference that import
+ * 4. Appends our configureClickHouse() and ClickHouseConfig declarations
+ *
+ * This ensures the compiler plugin's isMooseFile() check succeeds because
+ * all .d.ts files live under @bayoudhi/moose-lib-serverless/dist/.
+ */
+function copyUpstreamTypes(): void {
+  const upstreamDist = resolve(
+    __dirname,
+    "node_modules/@514labs/moose-lib/dist",
+  );
+  const outDir = resolve(__dirname, "dist");
+
+  if (!existsSync(outDir)) {
+    mkdirSync(outDir, { recursive: true });
+  }
+
+  // 1. Copy all chunk .d.ts files (everything except index.d.ts which we rewrite)
+  const chunkFiles = readdirSync(upstreamDist).filter(
+    (f) =>
+      f.endsWith(".d.ts") &&
+      f !== "index.d.ts" &&
+      f !== "compilerPlugin.d.ts" &&
+      f !== "moose-runner.d.ts" &&
+      f !== "moose-tspc.d.ts",
+  );
+
+  for (const chunk of chunkFiles) {
+    // Read-patch-write instead of raw copy:
+    // 1. Strip .js from relative imports so TS resolves to the .d.ts files
+    //    (e.g. './index-DdE-_e4q.js' → './index-DdE-_e4q')
+    // 2. Stub unavailable native module imports (@temporalio/client)
+    let chunkContent = readFileSync(join(upstreamDist, chunk), "utf8");
+    chunkContent = chunkContent.replace(/'\.\/(.*?)\.js'/g, "'./$1'");
+    // Replace `import { Client } from '@temporalio/client'` with a local stub.
+    // The Client type is used in WorkflowClient and getTemporalClient() which
+    // serverless users don't call, but the declaration must be valid TypeScript.
+    chunkContent = chunkContent.replace(
+      /^import \{ Client \} from '@temporalio\/client';$/m,
+      "type Client = any;",
+    );
+    // Also remove bare `import '@temporalio/client'` if present
+    chunkContent = chunkContent.replace(
+      /^import '@temporalio\/client';\n?/m,
+      "",
+    );
+    writeFileSync(join(outDir, chunk), chunkContent, "utf8");
+  }
+
+  // 2. Read upstream index.d.ts and patch it
+  let indexDts = readFileSync(join(upstreamDist, "index.d.ts"), "utf8");
+
+  // Rewrite relative .js references to bare specifiers so TypeScript resolves
+  // them to the .d.ts files in the same directory.
+  // e.g. './index-DdE-_e4q.js' → './index-DdE-_e4q'
+  //      './browserCompatible.js' → './browserCompatible'
+  indexDts = indexDts.replace(/'\.\/(.*?)\.js'/g, "'./$1'");
+
+  // Remove unavailable native module imports
+  indexDts = indexDts.replace(
+    /^import \{ KafkaJS \} from '@514labs\/kafka-javascript';\n/m,
+    "",
+  );
+  indexDts = indexDts.replace(/^import '@temporalio\/client';\n?/m, "");
+
+  // Stub the Kafka and Producer types that referenced the removed import.
+  // The upstream declares:
+  //   declare const Kafka: typeof KafkaJS.Kafka;
+  //   type Kafka = KafkaJS.Kafka;
+  //   type Producer = KafkaJS.Producer;
+  // We replace with `any` stubs since serverless users don't use Kafka.
+  indexDts = indexDts.replace(
+    /^declare const Kafka:.*$/m,
+    "declare const Kafka: any;",
+  );
+  indexDts = indexDts.replace(/^type Kafka = .*$/m, "type Kafka = any;");
+  indexDts = indexDts.replace(/^type Producer = .*$/m, "type Producer = any;");
+
+  // 3. Append our serverless-specific declarations
+  const serverlessDeclarations = `
+// ── @bayoudhi/moose-lib-serverless additions ──────────────────────────────
+
+/**
+ * ClickHouse connection configuration for serverless environments.
+ *
+ * In a standard Moose project, connection details are read from
+ * \`moose.config.toml\`. In serverless environments (AWS Lambda, Edge, etc.)
+ * this file doesn't exist, so you must provide the config programmatically
+ * via {@link configureClickHouse} before calling \`.insert()\` on any table.
+ */
+export interface ClickHouseConfig {
+  /** ClickHouse host (e.g. \"clickhouse.example.com\") */
+  host: string;
+  /** ClickHouse HTTP port as a string (e.g. \"8443\") */
+  port: string;
+  /** ClickHouse username (e.g. \"default\") */
+  username: string;
+  /** ClickHouse password */
+  password: string;
+  /** ClickHouse database name */
+  database: string;
+  /** Whether to use HTTPS/SSL for the connection */
+  useSSL: boolean;
+}
+
+/**
+ * Configure the ClickHouse connection for serverless environments.
+ *
+ * Call this once during cold start (before any \`.insert()\` calls) to provide
+ * ClickHouse connection details. This bypasses the \`moose.config.toml\` file
+ * lookup that would otherwise fail in environments without a Moose project
+ * structure.
+ */
+export declare function configureClickHouse(config: ClickHouseConfig): void;
+`;
+
+  indexDts += serverlessDeclarations;
+
+  // 4. Write both CJS (.d.ts) and ESM (.d.mts) type declarations
+  writeFileSync(join(outDir, "index.d.ts"), indexDts, "utf8");
+  writeFileSync(join(outDir, "index.d.mts"), indexDts, "utf8");
+
+  // Log what was copied for build visibility
+  const copiedFiles = [
+    ...chunkFiles,
+    "index.d.ts (patched)",
+    "index.d.mts (patched)",
+  ];
+  console.log(
+    `[copyUpstreamTypes] Copied ${copiedFiles.length} type declaration files:`,
+  );
+  copiedFiles.forEach((f) => console.log(`  - ${f}`));
+}
+
 // ─── Build Configurations ───────────────────────────────────────────────────
 
 /**
@@ -215,7 +369,10 @@ const patchedMooseRunner: Plugin = {
 const libraryConfig: Options = {
   entry: ["src/index.ts"],
   format: ["cjs", "esm"],
-  dts: { resolve: ["@514labs/moose-lib"] },
+  // DTS is handled by copyUpstreamTypes() in onSuccess — see below.
+  // tsup's dts.resolve doesn't fully inline the chunked upstream types,
+  // and the broken references prevent the compiler plugin from working.
+  dts: false,
   outDir: "dist",
   splitting: false,
   sourcemap: true,
@@ -243,6 +400,13 @@ const libraryConfig: Options = {
 
   // Stub out native modules so they never crash at load time.
   esbuildPlugins: [stubNativeModules],
+
+  // After the JS build, copy upstream .d.ts files into dist and create our
+  // own index.d.ts / index.d.mts wrappers. This produces self-contained type
+  // declarations that don't require @514labs/moose-lib to be installed.
+  async onSuccess() {
+    copyUpstreamTypes();
+  },
 };
 
 /**
