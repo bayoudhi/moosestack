@@ -647,6 +647,9 @@ importers:
       '@clickhouse/client':
         specifier: 1.8.1
         version: 1.8.1
+      commander:
+        specifier: ^13.1.0
+        version: 13.1.0
       csv-parse:
         specifier: ^5.5.5
         version: 5.6.0
@@ -656,6 +659,18 @@ importers:
       toml:
         specifier: 3.0.0
         version: 3.0.0
+      ts-node:
+        specifier: ^10.9.1
+        version: 10.9.2(@swc/core@1.15.0(@swc/helpers@0.5.17))(@types/node@20.19.24)(typescript@5.9.3)
+      ts-patch:
+        specifier: ^3.3.0
+        version: 3.3.0
+      tsconfig-paths:
+        specifier: ^4.2.0
+        version: 4.2.0
+      typescript:
+        specifier: ~5.9.2
+        version: 5.9.3
       typia:
         specifier: ^9.6.1
         version: 9.7.2(@types/node@20.19.24)(typescript@5.9.3)
