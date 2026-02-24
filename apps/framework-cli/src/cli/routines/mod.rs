@@ -97,6 +97,7 @@ use crate::framework::core::infrastructure_map::{
 };
 use crate::framework::core::migration_plan::{MigrationPlan, MigrationPlanWithBeforeAfter};
 use crate::framework::core::plan_validator;
+use crate::framework::typescript::parser::get_compiled_index_path;
 use crate::infrastructure::redis::redis_client::RedisClient;
 use crate::project::Project;
 use serde::Deserialize;
@@ -111,6 +112,7 @@ use tracing::{debug, error, info, warn};
 use super::super::metrics::Metrics;
 use super::local_webserver::{PlanRequest, PlanResponse, Webserver};
 use super::settings::{set_suppress_dev_setup_prompt, Settings};
+use super::ts_compilation_watcher::TsCompilationWatcher;
 use super::watcher::FileWatcher;
 use super::{display, prompt_user};
 use super::{Message, MessageType};
@@ -118,6 +120,7 @@ use super::{Message, MessageType};
 use crate::framework::core::partial_infrastructure_map::LifeCycle;
 use crate::framework::core::plan::plan_changes;
 use crate::framework::core::plan::InfraPlan;
+use crate::framework::core::plan::ReconciliationFilter;
 use crate::framework::core::state_storage::StateStorageBuilder;
 use crate::framework::languages::SupportedLanguages;
 use crate::infrastructure::olap::clickhouse::diff_strategy::ClickHouseTableDiffStrategy;
@@ -465,6 +468,12 @@ pub async fn start_development_mode(
     settings: &Settings,
     enable_mcp: bool,
 ) -> anyhow::Result<()> {
+    // Set global flag so ensure_typescript_compiled knows to skip
+    // (tspc --watch handles compilation in dev mode)
+    use crate::utilities::constants::IS_DEV_MODE;
+    use std::sync::atomic::Ordering;
+    IS_DEV_MODE.store(true, Ordering::Relaxed);
+
     display::show_message_wrapper(
         MessageType::Info,
         Message {
@@ -495,6 +504,35 @@ pub async fn start_development_mode(
         .await;
 
     let webapp_update_channel = web_server.spawn_webapp_update_listener(web_apps).await;
+
+    // For TypeScript projects, spawn tspc --watch early and wait for initial compilation.
+    // This serves dual purpose:
+    // 1. Compiles TypeScript so dmv2-serializer can use compiled output
+    // 2. Starts the watch process that will be used for incremental compilation
+    //
+    // The handle is stored and passed to TsCompilationWatcher::start() later.
+    // This avoids running tspc twice (one-off + watch) and prevents the bug where
+    // the watcher's initial compile_complete would trigger a duplicate plan_changes.
+    // For TypeScript, initial compilation is required (no ts-node fallback). Fail fast if it fails.
+    let ts_compile_handle = if project.language == SupportedLanguages::Typescript {
+        use crate::cli::ts_compilation_watcher::spawn_and_await_initial_compile;
+        match spawn_and_await_initial_compile(&project).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                error!("Initial TypeScript compilation failed: {}", e);
+                display::show_message_wrapper(
+                    MessageType::Error,
+                    Message {
+                        action: "Error".to_string(),
+                        details: format!("TypeScript compilation failed: {}", e),
+                    },
+                );
+                return Err(e.into());
+            }
+        }
+    } else {
+        None
+    };
 
     // Create state storage once based on project configuration
     let state_storage = StateStorageBuilder::from_config(&project)
@@ -702,19 +740,45 @@ pub async fn start_development_mode(
     // Create shutdown channel for graceful watcher termination
     let (watcher_shutdown_tx, watcher_shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let file_watcher = FileWatcher::new();
-    file_watcher.start(
-        project.clone(),
-        route_update_channel,
-        webapp_update_channel,
-        infra_map,
-        process_registry.clone(),
-        metrics.clone(),
-        Arc::new(state_storage),
-        settings.clone(),
-        processing_coordinator.clone(),
-        watcher_shutdown_rx,
-    )?;
+    // Use TypeScript compilation watcher for TS projects (incremental compilation)
+    // Use file watcher for Python projects
+    let state_storage = Arc::new(state_storage);
+    match project.language {
+        SupportedLanguages::Typescript => {
+            // Pass the handle from spawn_and_await_initial_compile() if we have one.
+            // This continues watching the already-running tspc process instead of
+            // spawning a new one, and ensures we don't trigger duplicate plan_changes.
+            let ts_watcher = TsCompilationWatcher::new();
+            ts_watcher.start(
+                project.clone(),
+                route_update_channel,
+                webapp_update_channel,
+                infra_map,
+                process_registry.clone(),
+                metrics.clone(),
+                state_storage,
+                settings.clone(),
+                processing_coordinator.clone(),
+                watcher_shutdown_rx,
+                ts_compile_handle,
+            )?;
+        }
+        SupportedLanguages::Python => {
+            let file_watcher = FileWatcher::new();
+            file_watcher.start(
+                project.clone(),
+                route_update_channel,
+                webapp_update_channel,
+                infra_map,
+                process_registry.clone(),
+                metrics.clone(),
+                state_storage,
+                settings.clone(),
+                processing_coordinator.clone(),
+                watcher_shutdown_rx,
+            )?;
+        }
+    }
 
     // Log MCP server status
     if enable_mcp {
@@ -781,6 +845,8 @@ pub async fn start_production_mode(
 
     // Pre-compile TypeScript with moose plugins for faster startup
     // This eliminates ts-node overhead in production by using pre-compiled JavaScript
+    // Compile TypeScript before starting production mode
+    // Respects user's tsconfig.json outDir if specified
     if project.language == SupportedLanguages::Typescript {
         display::show_message_wrapper(
             MessageType::Info,
@@ -790,9 +856,9 @@ pub async fn start_production_mode(
             },
         );
 
+        // Don't pass outDir - let moose-tspc read from tsconfig or use default
         let compile_result = std::process::Command::new("npx")
             .arg("moose-tspc")
-            .arg(".moose/compiled")
             .current_dir(&project.project_location)
             .env("MOOSE_SOURCE_DIR", &project.source_dir)
             .output();
@@ -809,25 +875,40 @@ pub async fn start_production_mode(
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("TypeScript compilation failed: {}", stderr);
+                // Check if compiled artifacts exist (compilation might have warnings but succeeded)
+                let compiled_index = get_compiled_index_path(&project);
+                if compiled_index.exists() {
+                    debug!("TypeScript compiled with warnings: {}", stderr);
+                    display::show_message_wrapper(
+                        MessageType::Success,
+                        Message {
+                            action: "Compiled".to_string(),
+                            details: "TypeScript successfully (with warnings)".to_string(),
+                        },
+                    );
+                } else {
+                    error!("TypeScript compilation failed: {}", stderr);
+                    display::show_message_wrapper(
+                        MessageType::Error,
+                        Message {
+                            action: "Error".to_string(),
+                            details: "TypeScript compilation failed".to_string(),
+                        },
+                    );
+                    return Err(anyhow::anyhow!("TypeScript compilation failed: {}", stderr));
+                }
+            }
+            Err(e) => {
+                error!("Failed to run moose-tspc: {}", e);
                 display::show_message_wrapper(
-                    MessageType::Warning,
+                    MessageType::Error,
                     Message {
-                        action: "Warning".to_string(),
-                        details: "TypeScript compilation failed, falling back to ts-node"
+                        action: "Error".to_string(),
+                        details: "moose-tspc not found - ensure @514labs/moose-lib is installed"
                             .to_string(),
                     },
                 );
-            }
-            Err(e) => {
-                warn!("Failed to run moose-tspc: {}", e);
-                display::show_message_wrapper(
-                    MessageType::Warning,
-                    Message {
-                        action: "Warning".to_string(),
-                        details: "moose-tspc not found, falling back to ts-node".to_string(),
-                    },
-                );
+                return Err(anyhow::anyhow!("Failed to run moose-tspc: {}", e));
             }
         }
     }
@@ -1188,30 +1269,9 @@ pub async fn remote_plan(
             );
         }
 
-        let table_names: HashSet<String> = local_infra_map
-            .tables
-            .values()
-            .map(|t| t.id(&local_infra_map.default_database))
-            .collect();
+        let filter = ReconciliationFilter::from_infra_map(&local_infra_map);
 
-        let sql_resource_ids: HashSet<String> =
-            local_infra_map.sql_resources.keys().cloned().collect();
-
-        let materialized_view_ids: HashSet<String> =
-            local_infra_map.materialized_views.keys().cloned().collect();
-
-        let view_ids: HashSet<String> = local_infra_map.views.keys().cloned().collect();
-
-        get_remote_inframap_serverless(
-            project,
-            clickhouse_url,
-            None,
-            &table_names,
-            &sql_resource_ids,
-            &materialized_view_ids,
-            &view_ids,
-        )
-        .await?
+        get_remote_inframap_serverless(project, clickhouse_url, None, &filter).await?
     } else {
         // Moose server flow
         if !json {
@@ -1398,27 +1458,10 @@ pub async fn remote_gen_migration(
                 },
             );
 
-            let target_table_ids: HashSet<String> = local_infra_map
-                .tables
-                .values()
-                .map(|t| t.id(&local_infra_map.default_database))
-                .collect();
-            let target_sql_resource_ids: HashSet<String> =
-                local_infra_map.sql_resources.keys().cloned().collect();
-            let target_materialized_view_ids: HashSet<String> =
-                local_infra_map.materialized_views.keys().cloned().collect();
-            let target_view_ids: HashSet<String> = local_infra_map.views.keys().cloned().collect();
+            let filter = ReconciliationFilter::from_infra_map(&local_infra_map);
 
-            get_remote_inframap_serverless(
-                project,
-                clickhouse_url,
-                redis_url.as_deref(),
-                &target_table_ids,
-                &target_sql_resource_ids,
-                &target_materialized_view_ids,
-                &target_view_ids,
-            )
-            .await?
+            get_remote_inframap_serverless(project, clickhouse_url, redis_url.as_deref(), &filter)
+                .await?
         }
     };
 
@@ -1481,10 +1524,7 @@ async fn get_remote_inframap_serverless(
     project: &Project,
     clickhouse_url: &str,
     redis_url: Option<&str>,
-    target_table_ids: &HashSet<String>,
-    target_sql_resource_ids: &HashSet<String>,
-    target_materialized_view_ids: &HashSet<String>,
-    target_view_ids: &HashSet<String>,
+    filter: &ReconciliationFilter,
 ) -> anyhow::Result<InfrastructureMap> {
     use crate::infrastructure::olap::clickhouse::config::parse_clickhouse_connection_string;
     use crate::infrastructure::olap::clickhouse::create_client;
@@ -1504,10 +1544,7 @@ async fn get_remote_inframap_serverless(
         project,
         &*state_storage,
         olap_client,
-        target_table_ids,
-        target_sql_resource_ids,
-        target_materialized_view_ids,
-        target_view_ids,
+        filter,
     )
     .await?;
 

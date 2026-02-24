@@ -72,12 +72,13 @@ use crate::{
 ///
 /// This enum controls the behavior when there are differences between code definitions
 /// and the actual database schema or structure.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LifeCycle {
     /// Full automatic management (default behavior).
     /// Moose will automatically modify database resources to match code definitions,
     /// including potentially destructive operations like dropping columns or tables.
+    #[default]
     FullyManaged,
 
     /// Deletion-protected automatic management.
@@ -92,9 +93,8 @@ pub enum LifeCycle {
 }
 
 impl LifeCycle {
-    // not implementing the Default trait to avoid accidentally setting this value
     pub fn default_for_deserialization() -> LifeCycle {
-        LifeCycle::FullyManaged
+        LifeCycle::default()
     }
 
     /// Returns true if this lifecycle protects the table from being dropped.
@@ -305,6 +305,14 @@ enum EngineConfig {
 
     #[serde(rename = "Kafka")]
     Kafka(Box<KafkaConfig>),
+
+    #[serde(rename = "Merge")]
+    Merge {
+        #[serde(alias = "sourceDatabase")]
+        source_database: String,
+        #[serde(alias = "tablesRegexp")]
+        tables_regexp: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,10 +595,32 @@ impl PartialInfrastructureMap {
     ) -> Result<PartialInfrastructureMap, DmV2LoadingError> {
         let output = process.wait_with_output().await?;
 
-        // needs from_utf8_lossy_owned
+        let raw_string_stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let raw_string_stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        if !raw_string_stderr.is_empty() {
+        // Try to parse stdout first. Subprocess stderr may contain non-fatal
+        // warnings (e.g. Python deprecation notices) that should not block
+        // resource collection when stdout carries a valid payload.
+        let output_format = || DmV2LoadingError::Other {
+            message: "invalid output format".to_string(),
+        };
+
+        if let Some(json) = raw_string_stdout
+            .split("___MOOSE_STUFF___start")
+            .nth(1)
+            .and_then(|s| s.split("end___MOOSE_STUFF___").next())
+        {
+            if !raw_string_stderr.is_empty() {
+                tracing::warn!(
+                    "Subprocess for {} produced warnings on stderr:\n{}",
+                    user_code_file_name,
+                    raw_string_stderr,
+                );
+            }
+            tracing::info!("load_from_user_code inframap json: {}", json);
+            Ok(serde_json::from_str(json)
+                .inspect_err(|_| debug!("Invalid JSON from exports: {}", raw_string_stdout))?)
+        } else if !raw_string_stderr.is_empty() {
             let error_message = if raw_string_stderr.contains("MODULE_NOT_FOUND")
                 || raw_string_stderr.contains("ModuleNotFoundError")
             {
@@ -606,8 +636,7 @@ impl PartialInfrastructureMap {
                     });
                 };
 
-                format!("Missing dependencies detected. Please run '{install_command}' and try again.\nOriginal error: {raw_string_stderr}"
-                )
+                format!("Missing dependencies detected. Please run '{install_command}' and try again.\nOriginal error: {raw_string_stderr}")
             } else {
                 raw_string_stderr
             };
@@ -617,23 +646,7 @@ impl PartialInfrastructureMap {
                 message: error_message,
             })
         } else {
-            let raw_string_stdout: String = String::from_utf8_lossy(&output.stdout).to_string();
-
-            let output_format = || DmV2LoadingError::Other {
-                message: "invalid output format".to_string(),
-            };
-
-            let json = raw_string_stdout
-                .split("___MOOSE_STUFF___start")
-                .nth(1)
-                .ok_or_else(output_format)?
-                .split("end___MOOSE_STUFF___")
-                .next()
-                .ok_or_else(output_format)?;
-            tracing::info!("load_from_user_code inframap json: {}", json);
-
-            Ok(serde_json::from_str(json)
-                .inspect_err(|_| debug!("Invalid JSON from exports: {}", raw_string_stdout))?)
+            Err(output_format())
         }
     }
 
@@ -728,7 +741,7 @@ impl PartialInfrastructureMap {
                     .as_ref()
                     .map(|v_str| Version::from_string(v_str.clone()));
 
-                let engine = self.parse_engine(partial_table)?;
+                let engine = self.parse_engine(partial_table, default_database)?;
                 let engine_params_hash = Some(engine.non_alterable_params_hash());
 
                 // S3Queue settings should come directly from table_settings in the user code
@@ -817,9 +830,14 @@ impl PartialInfrastructureMap {
     /// For S3Queue engines, this method resolves runtime environment variable markers into actual values.
     /// This ensures secrets are resolved before the infrastructure diff is calculated, allowing credential
     /// rotation to trigger table recreation.
+    ///
+    /// For Merge engines, `currentDatabase()` in `source_database` is resolved to the actual
+    /// database name. ClickHouse resolves this function at table creation time and stores the
+    /// literal name, so we must resolve it on the desired-state side to avoid false diffs.
     fn parse_engine(
         &self,
         partial_table: &PartialTable,
+        default_database: &str,
     ) -> Result<ClickhouseEngine, DmV2LoadingError> {
         match &partial_table.engine_config {
             Some(EngineConfig::MergeTree {}) => Ok(ClickhouseEngine::MergeTree),
@@ -978,6 +996,23 @@ impl PartialInfrastructureMap {
                 group_name: config.group_name.clone(),
                 format: config.format.clone(),
             }),
+
+            Some(EngineConfig::Merge {
+                source_database,
+                tables_regexp,
+            }) => {
+                // Resolve currentDatabase() to the actual database name so the desired state
+                // matches what ClickHouse stores (it resolves this function at creation time).
+                let resolved_db = if source_database == "currentDatabase()" {
+                    default_database.to_string()
+                } else {
+                    source_database.clone()
+                };
+                Ok(ClickhouseEngine::Merge {
+                    source_database: resolved_db,
+                    tables_regexp: tables_regexp.clone(),
+                })
+            }
 
             None => Ok(ClickhouseEngine::MergeTree),
         }

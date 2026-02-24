@@ -52,6 +52,7 @@ use crate::framework::core::lifecycle_filter;
 use crate::framework::languages::SupportedLanguages;
 use crate::framework::python::datamodel_config::load_main_py;
 use crate::framework::scripts::Workflow;
+use crate::framework::typescript::parser::ensure_typescript_compiled;
 use crate::infrastructure::olap::clickhouse::codec_expressions_are_equivalent;
 use crate::infrastructure::olap::clickhouse::config::DEFAULT_DATABASE_NAME;
 use crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine;
@@ -884,6 +885,8 @@ impl InfrastructureMap {
             is_production,
             &self.default_database,
             &mut changes.olap_changes,
+            &mut changes.filtered_olap_changes,
+            respect_life_cycle,
         );
         let mv_changes = changes.olap_changes.len() - olap_changes_len_before;
         tracing::info!("Materialized View changes detected: {}", mv_changes);
@@ -1643,6 +1646,7 @@ impl InfrastructureMap {
     /// * `is_production` - Whether we're in production mode (population only in dev)
     /// * `default_database` - Default database name for normalization
     /// * `olap_changes` - Mutable vector to collect the identified changes
+    #[allow(clippy::too_many_arguments)]
     pub fn diff_materialized_views(
         self_mvs: &HashMap<String, MaterializedView>,
         target_mvs: &HashMap<String, MaterializedView>,
@@ -1650,6 +1654,8 @@ impl InfrastructureMap {
         is_production: bool,
         default_database: &str,
         olap_changes: &mut Vec<OlapChange>,
+        filtered_changes: &mut Vec<FilteredChange>,
+        respect_life_cycle: bool,
     ) {
         use crate::framework::core::infra_reality_checker::materialized_views_are_equivalent;
 
@@ -1668,47 +1674,99 @@ impl InfrastructureMap {
                 // Use semantic equivalence check instead of plain !=
                 if !materialized_views_are_equivalent(mv, target_mv, default_database) {
                     tracing::debug!("Materialized view '{}' has differences", id);
-                    mv_updates += 1;
-                    olap_changes.push(OlapChange::MaterializedView(Change::Updated {
-                        before: Box::new(mv.clone()),
-                        after: Box::new(target_mv.clone()),
-                    }));
+                    // MV update = DROP + CREATE in ClickHouse. Block if drop-protected.
+                    // Check the AFTER lifecycle (target_mv) to handle transitions.
+                    if respect_life_cycle && target_mv.life_cycle.is_drop_protected() {
+                        tracing::warn!(
+                            "Blocking update of {:?} materialized view '{}' (update requires DROP+CREATE)",
+                            target_mv.life_cycle,
+                            id
+                        );
+                        filtered_changes.push(FilteredChange {
+                            reason: format!(
+                                "MaterializedView '{}' has {:?} lifecycle - UPDATE (DROP+CREATE) blocked",
+                                mv.name, target_mv.life_cycle
+                            ),
+                            change: OlapChange::MaterializedView(Change::Updated {
+                                before: Box::new(mv.clone()),
+                                after: Box::new(target_mv.clone()),
+                            }),
+                        });
+                    } else {
+                        mv_updates += 1;
+                        olap_changes.push(OlapChange::MaterializedView(Change::Updated {
+                            before: Box::new(mv.clone()),
+                            after: Box::new(target_mv.clone()),
+                        }));
 
-                    // Check if updated MV needs population (only in dev)
-                    // Pass true to populate - updated MVs need their data refreshed
-                    Self::check_materialized_view_population(
-                        target_mv,
-                        tables,
-                        true, // should_populate
-                        is_production,
-                        olap_changes,
-                    );
+                        // Check if updated MV needs population (only in dev)
+                        // Pass true to populate - updated MVs need their data refreshed
+                        Self::check_materialized_view_population(
+                            target_mv,
+                            tables,
+                            true, // should_populate
+                            is_production,
+                            olap_changes,
+                        );
+                    }
                 }
             } else {
                 tracing::debug!("Materialized view '{}' removed", id);
-                mv_removals += 1;
-                olap_changes.push(OlapChange::MaterializedView(Change::Removed(Box::new(
-                    mv.clone(),
-                ))));
+                // Block removal if drop-protected
+                if respect_life_cycle && mv.life_cycle.is_drop_protected() {
+                    tracing::warn!(
+                        "Blocking removal of {:?} materialized view '{}'",
+                        mv.life_cycle,
+                        id
+                    );
+                    filtered_changes.push(FilteredChange {
+                        reason: format!(
+                            "MaterializedView '{}' has {:?} lifecycle - DROP blocked",
+                            mv.name, mv.life_cycle
+                        ),
+                        change: OlapChange::MaterializedView(Change::Removed(Box::new(mv.clone()))),
+                    });
+                } else {
+                    mv_removals += 1;
+                    olap_changes.push(OlapChange::MaterializedView(Change::Removed(Box::new(
+                        mv.clone(),
+                    ))));
+                }
             }
         }
 
         for (id, mv) in target_mvs {
             if !self_mvs.contains_key(id) {
                 tracing::debug!("Materialized view '{}' added", id);
-                mv_additions += 1;
-                olap_changes.push(OlapChange::MaterializedView(Change::Added(Box::new(
-                    mv.clone(),
-                ))));
+                // Block creation if externally managed
+                if respect_life_cycle && mv.life_cycle.is_any_modification_protected() {
+                    tracing::warn!(
+                        "Blocking creation of {:?} materialized view '{}'",
+                        mv.life_cycle,
+                        id
+                    );
+                    filtered_changes.push(FilteredChange {
+                        reason: format!(
+                            "MaterializedView '{}' has {:?} lifecycle - CREATE blocked",
+                            mv.name, mv.life_cycle
+                        ),
+                        change: OlapChange::MaterializedView(Change::Added(Box::new(mv.clone()))),
+                    });
+                } else {
+                    mv_additions += 1;
+                    olap_changes.push(OlapChange::MaterializedView(Change::Added(Box::new(
+                        mv.clone(),
+                    ))));
 
-                // Check if new MV needs population (only in dev)
-                Self::check_materialized_view_population(
-                    mv,
-                    tables,
-                    true, // should_populate
-                    is_production,
-                    olap_changes,
-                );
+                    // Check if new MV needs population (only in dev)
+                    Self::check_materialized_view_population(
+                        mv,
+                        tables,
+                        true, // should_populate
+                        is_production,
+                        olap_changes,
+                    );
+                }
             }
         }
 
@@ -2878,6 +2936,7 @@ impl InfrastructureMap {
             target_table: parsed.target_table,
             target_database: parsed.target_database,
             metadata,
+            life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
         })
     }
 
@@ -3142,11 +3201,22 @@ impl InfrastructureMap {
     ///
     /// # Returns
     /// A Result containing the infrastructure map or an error
+    ///
+    /// # Arguments
+    /// * `project` - The project configuration
+    /// * `resolve_credentials` - Whether to resolve credentials from environment
+    /// * `skip_compilation` - Skip TypeScript compilation (use when watcher already compiled)
     pub async fn load_from_user_code(
         project: &Project,
         resolve_credentials: bool,
     ) -> anyhow::Result<Self> {
         let partial = if project.language == SupportedLanguages::Typescript {
+            // Ensure TypeScript is compiled before loading infrastructure.
+            // In dev mode, this is a no-op because tspc --watch handles compilation.
+            // For CLI commands, this runs moose-tspc to compile.
+            ensure_typescript_compiled(project)
+                .context("Failed to compile TypeScript before loading infrastructure")?;
+
             let process = crate::framework::typescript::export_collectors::collect_from_index(
                 project,
                 &project.project_location,
@@ -4715,6 +4785,60 @@ mod diff_tests {
                 assert_eq!(a.default.as_deref(), Some("now()"));
             }
             _ => panic!("Expected Updated change"),
+        }
+    }
+
+    #[test]
+    fn test_column_default_removal() {
+        // Test that removing a DEFAULT value (Some -> None) is detected as a change
+        let mut before = create_test_table("test", "1.0");
+        let mut after = create_test_table("test", "1.0");
+
+        // Column with a DEFAULT value
+        before.columns.push(Column {
+            name: "status".to_string(),
+            data_type: ColumnType::String,
+            required: true,
+            unique: false,
+            primary_key: false,
+            default: Some("'pending'".to_string()), // Has DEFAULT
+            annotations: vec![],
+            comment: None,
+            ttl: None,
+            codec: None,
+            materialized: None,
+        });
+
+        // Same column without DEFAULT value
+        after.columns.push(Column {
+            name: "status".to_string(),
+            data_type: ColumnType::String,
+            required: true,
+            unique: false,
+            primary_key: false,
+            default: None, // No DEFAULT
+            annotations: vec![],
+            comment: None,
+            ttl: None,
+            codec: None,
+            materialized: None,
+        });
+
+        let diff = compute_table_columns_diff(&before, &after);
+        assert_eq!(diff.len(), 1, "Expected one change for DEFAULT removal");
+        match &diff[0] {
+            ColumnChange::Updated {
+                before: b,
+                after: a,
+            } => {
+                assert_eq!(
+                    b.default.as_deref(),
+                    Some("'pending'"),
+                    "Before should have DEFAULT"
+                );
+                assert_eq!(a.default, None, "After should have no DEFAULT");
+            }
+            _ => panic!("Expected Updated change for DEFAULT removal"),
         }
     }
 

@@ -942,6 +942,12 @@ const moosestackNavigationConfig: NavigationConfig = [
         title: "Minimum Requirements",
         languages: ["typescript", "python"],
       },
+      {
+        type: "page",
+        slug: "moosestack/help/windows-setup",
+        title: "Windows Setup",
+        languages: ["typescript", "python"],
+      },
     ],
   },
   {
@@ -951,6 +957,12 @@ const moosestackNavigationConfig: NavigationConfig = [
     icon: IconFileReport,
     languages: ["typescript", "python"],
     children: [
+      {
+        type: "page",
+        slug: "moosestack/release-notes/2026-02-19",
+        title: "February 19, 2026",
+        languages: ["typescript", "python"],
+      },
       {
         type: "page",
         slug: "moosestack/release-notes/2026-02-12",
@@ -1056,30 +1068,73 @@ const moosestackNavigationConfig: NavigationConfig = [
 ];
 
 /**
- * Hosting navigation configuration (placeholder)
+ * Hosting navigation configuration
  */
 const hostingNavigationConfig: NavigationConfig = [
   {
     type: "page",
-    slug: "hosting/overview",
-    title: "Overview",
-    icon: IconChartArea,
-    languages: ["typescript", "python"],
-  },
-  {
-    type: "page",
-    slug: "hosting/getting-started",
-    title: "Getting Started",
-    icon: IconDatabase,
+    slug: "hosting",
+    title: "Hosting Overview",
     languages: ["typescript", "python"],
   },
   { type: "separator" },
-  { type: "label", title: "Deployment" },
+  { type: "label", title: "CLI" },
   {
     type: "page",
-    slug: "hosting/deployment",
-    title: "Deployment Guide",
-    icon: IconHammer,
+    slug: "hosting/cli",
+    title: "--help",
+    languages: ["typescript", "python"],
+  },
+  {
+    type: "page",
+    slug: "hosting/cli/auth",
+    title: "auth",
+    languages: ["typescript", "python"],
+  },
+  {
+    type: "page",
+    slug: "hosting/cli/orgs",
+    title: "orgs",
+    languages: ["typescript", "python"],
+  },
+  {
+    type: "page",
+    slug: "hosting/cli/link",
+    title: "link",
+    languages: ["typescript", "python"],
+  },
+  {
+    type: "page",
+    slug: "hosting/cli/projects",
+    title: "projects",
+    languages: ["typescript", "python"],
+  },
+  {
+    type: "page",
+    slug: "hosting/cli/setup",
+    title: "setup",
+    languages: ["typescript", "python"],
+  },
+  {
+    type: "page",
+    slug: "hosting/cli/update",
+    title: "update",
+    languages: ["typescript", "python"],
+  },
+  { type: "separator" },
+  { type: "label", title: "Workflow" },
+  {
+    type: "page",
+    slug: "hosting/workflow/fiveonefour-to-local-setup",
+    title: "Fiveonefour to Local Setup",
+    languages: ["typescript", "python"],
+  },
+  { type: "separator" },
+  { type: "label", title: "Troubleshooting" },
+  {
+    type: "page",
+    slug: "hosting/troubleshooting/setup-failures",
+    title: "Setup Failures",
     languages: ["typescript", "python"],
   },
 ];
@@ -1263,7 +1318,7 @@ const guidesNavigationConfig: NavigationConfig = [
   {
     type: "page",
     slug: "guides/performant-dashboards",
-    title: "Improving Performance",
+    title: "Improving the Performance of Your Dashboards",
     description:
       "Already have a dashboard or report running? Here's how to boost performance with OLAP best practices.",
     icon: IconChartLine,

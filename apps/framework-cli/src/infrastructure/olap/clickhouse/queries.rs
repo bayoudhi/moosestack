@@ -7,6 +7,7 @@ use tracing::info;
 use super::errors::ClickhouseError;
 use super::model::ClickHouseColumn;
 use crate::framework::core::infrastructure::table::{EnumValue, OrderBy};
+use crate::infrastructure::olap::clickhouse::build_column_property_clauses;
 use crate::infrastructure::olap::clickhouse::model::{
     wrap_and_join_column_names, AggregationFunction, ClickHouseColumnType, ClickHouseFloat,
     ClickHouseInt, ClickHouseTable,
@@ -124,7 +125,7 @@ static CREATE_TABLE_TEMPLATE: &str = r#"
 CREATE TABLE IF NOT EXISTS `{{db_name}}`.`{{table_name}}`{{#if cluster_name}}
 ON CLUSTER `{{cluster_name}}`{{/if}}
 (
-{{#each fields}} `{{field_name}}` {{{field_type}}} {{field_nullable}}{{#if field_default}} DEFAULT {{{field_default}}}{{/if}}{{#if field_materialized}} MATERIALIZED {{{field_materialized}}}{{/if}}{{#if field_codec}} CODEC({{{field_codec}}}){{/if}}{{#if field_ttl}} TTL {{{field_ttl}}}{{/if}}{{#if field_comment}} COMMENT '{{{field_comment}}}'{{/if}}{{#unless @last}},
+{{#each fields}} `{{field_name}}` {{{field_type}}} {{field_nullable}}{{{field_properties}}}{{#unless @last}},
 {{/unless}}{{/each}}{{#if has_indexes}}, {{#each indexes}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}{{/if}}
 )
 ENGINE = {{engine}}{{#if primary_key_string}}
@@ -373,6 +374,12 @@ pub enum ClickhouseEngine {
         group_name: String,
         format: String,
     },
+    Merge {
+        // Database to scan for source tables (literal name, currentDatabase(), or REGEXP(...))
+        source_database: String,
+        // Regex pattern to match table names in the source database
+        tables_regexp: String,
+    },
 }
 
 // The implementation is not symetric between TryFrom and Into so we
@@ -505,6 +512,10 @@ impl Into<String> for ClickhouseEngine {
                 group_name,
                 format,
             } => Self::serialize_kafka_for_display(&broker_list, &topic_list, &group_name, &format),
+            ClickhouseEngine::Merge {
+                source_database,
+                tables_regexp,
+            } => Self::serialize_merge(&source_database, &tables_regexp),
             // this might sound obvious, but when you edit this function
             // please check if you have changed the parsing side (try_from) as well
             // especially if you're an LLM
@@ -1023,6 +1034,7 @@ impl ClickhouseEngine {
             s if s.starts_with("Distributed(") => Self::parse_regular_distributed(s, value),
             s if s.starts_with("Iceberg(") => Self::parse_regular_icebergs3(s, value),
             s if s.starts_with("Kafka(") => Self::parse_regular_kafka(s, value),
+            s if s.starts_with("Merge(") => Self::parse_regular_merge(s, value),
             _ => Err(value),
         }
     }
@@ -1082,6 +1094,50 @@ impl ClickhouseEngine {
         } else {
             Err(original_value)
         }
+    }
+
+    /// Parse Merge engine from ClickHouse's `create_table_query` format.
+    ///
+    /// Uses a custom parser instead of `parse_quoted_csv` because `source_database`
+    /// can be an unquoted expression with nested parens/quotes (e.g., `REGEXP('...')`).
+    fn parse_regular_merge<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        let content = engine_name
+            .strip_prefix("Merge(")
+            .and_then(|s| s.strip_suffix(")"))
+            .ok_or(original_value)?;
+
+        // tables_regexp is always the last single-quoted string.
+        // Search from the end so REGEXP('...') in source_database doesn't confuse us.
+        let last_quote = content.rfind('\'').ok_or(original_value)?;
+        let open_quote = content[..last_quote].rfind('\'').ok_or(original_value)?;
+        let tables_regexp = &content[open_quote + 1..last_quote];
+
+        // Everything before the tables_regexp quoted string is source_database
+        let source_database = content[..open_quote].trim().trim_end_matches(',').trim();
+
+        // Strip surrounding quotes from literal database names ('my_db' → my_db)
+        // but keep expressions like REGEXP('...') intact
+        let source_database = if source_database.len() >= 2
+            && source_database.starts_with('\'')
+            && source_database.ends_with('\'')
+        {
+            &source_database[1..source_database.len() - 1]
+        } else {
+            source_database
+        };
+
+        if source_database.is_empty() || tables_regexp.is_empty() {
+            return Err(original_value);
+        }
+
+        // ClickHouse stores backslashes double-escaped (\d → \\d). Unescape to match user intent.
+        Ok(ClickhouseEngine::Merge {
+            source_database: source_database.replace("\\\\", "\\"),
+            tables_regexp: tables_regexp.replace("\\\\", "\\"),
+        })
     }
 
     /// Parse regular Iceberg with parameters
@@ -1558,6 +1614,10 @@ impl ClickhouseEngine {
                 group_name,
                 format,
             ),
+            ClickhouseEngine::Merge {
+                source_database,
+                tables_regexp,
+            } => Self::serialize_merge(source_database, tables_regexp),
         }
     }
 
@@ -1950,6 +2010,16 @@ impl ClickhouseEngine {
         ));
         result.push(')');
         result
+    }
+
+    /// Serialize Merge engine. Literal database names are quoted; expressions
+    /// containing `(` (e.g., `currentDatabase()`, `REGEXP(...)`) are left unquoted.
+    fn serialize_merge(source_database: &str, tables_regexp: &str) -> String {
+        if source_database.contains('(') {
+            format!("Merge({}, '{}')", source_database, tables_regexp)
+        } else {
+            format!("Merge('{}', '{}')", source_database, tables_regexp)
+        }
     }
 
     /// Serialize SummingMergeTree engine to string format
@@ -2731,6 +2801,14 @@ impl ClickhouseEngine {
                 hasher.update(group_name.as_bytes());
                 hasher.update(format.as_bytes());
             }
+            ClickhouseEngine::Merge {
+                source_database,
+                tables_regexp,
+            } => {
+                hasher.update("Merge".as_bytes());
+                hasher.update(source_database.as_bytes());
+                hasher.update(tables_regexp.as_bytes());
+            }
         }
 
         format!("{:x}", hasher.finalize())
@@ -3294,6 +3372,10 @@ pub fn create_table_query(
                 broker_list, topic_list, group_name, format
             )
         }
+        ClickhouseEngine::Merge {
+            source_database,
+            tables_regexp,
+        } => ClickhouseEngine::serialize_merge(source_database, tables_regexp),
     };
 
     // Format settings from table.table_settings
@@ -3688,33 +3770,11 @@ fn builds_field_context(columns: &[ClickHouseColumn]) -> Result<Vec<Value>, Clic
         .iter()
         .map(|column| {
             let field_type = basic_field_type_to_string(&column.column_type)?;
-
-            // Escape for ClickHouse SQL string literals:
-            // 1. First escape backslashes (\ → \\) to preserve them
-            // 2. Then escape single quotes (' → '') for SQL safety
-            let escaped_comment = column
-                .comment
-                .as_ref()
-                .map(|c| c.replace('\\', "\\\\").replace('\'', "''"));
-
-            let field_ttl = column.ttl.as_ref();
-            let field_codec = column.codec.as_ref();
-            let field_materialized = column.materialized.as_ref();
-
-            // Default values from ClickHouse/Python are already properly formatted
-            // - String literals come with quotes: 'active'
-            // - SQL expressions come without quotes: xxHash64(_id), now(), today()
-            // - Numbers come without quotes: 42
-            // So we use them as-is without additional formatting
-            let formatted_default = column.default.as_ref();
+            let field_properties = build_column_property_clauses(column);
 
             Ok(json!({
                 "field_name": column.name,
                 "field_type": field_type,
-                "field_ttl": field_ttl,
-                "field_codec": field_codec,
-                "field_materialized": field_materialized,
-                "field_default": formatted_default,
                 "field_nullable": if let ClickHouseColumnType::Nullable(_) = column.column_type {
                     // if type is Nullable, do not add extra specifier
                     "".to_string()
@@ -3724,7 +3784,7 @@ fn builds_field_context(columns: &[ClickHouseColumn]) -> Result<Vec<Value>, Clic
                 } else {
                     "NULL".to_string()
                 },
-                "field_comment": escaped_comment,
+                "field_properties": field_properties,
             }))
         })
         .collect::<Result<Vec<Value>, ClickhouseError>>()
@@ -7191,5 +7251,130 @@ ORDER BY (`event_time`)
         let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
         assert!(parsed.is_ok(), "Failed to parse '{}'", serialized);
         assert_eq!(parsed.unwrap(), engine);
+    }
+
+    #[test]
+    fn test_merge_parsing_from_clickhouse() {
+        // Inputs match real ClickHouse create_table_query output
+
+        // Literal database
+        let engine = ClickhouseEngine::try_from("Merge('local', '^test_merge_source')").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::Merge {
+                source_database: "local".to_string(),
+                tables_regexp: "^test_merge_source".to_string(),
+            }
+        );
+        let serialized: String = engine.clone().into();
+        assert_eq!(serialized, "Merge('local', '^test_merge_source')");
+        assert_eq!(
+            ClickhouseEngine::try_from(serialized.as_str()).unwrap(),
+            engine
+        );
+
+        // Backslash regex — ClickHouse stores \d as \\d
+        let engine = ClickhouseEngine::try_from("Merge('local', '^events_\\\\d+$')").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::Merge {
+                source_database: "local".to_string(),
+                tables_regexp: "^events_\\d+$".to_string(),
+            }
+        );
+
+        // REGEXP database — preserved as-is, backslashes double-escaped
+        let engine = ClickhouseEngine::try_from("Merge(REGEXP('db_\\\\d+'), '^events_')").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::Merge {
+                source_database: "REGEXP('db_\\d+')".to_string(),
+                tables_regexp: "^events_".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_merge_proto_roundtrip() {
+        let engine = ClickhouseEngine::Merge {
+            source_database: "my_database".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        let serialized = engine.to_proto_string();
+        assert_eq!(serialized, "Merge('my_database', '^events_.*$')");
+        assert_eq!(
+            ClickhouseEngine::try_from(serialized.as_str()).unwrap(),
+            engine
+        );
+
+        // With backslash in regex
+        let engine = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_\\d+$".to_string(),
+        };
+        let serialized = engine.to_proto_string();
+        assert_eq!(serialized, "Merge('local', '^events_\\d+$')");
+        assert_eq!(
+            ClickhouseEngine::try_from(serialized.as_str()).unwrap(),
+            engine
+        );
+    }
+
+    #[test]
+    fn test_merge_desired_vs_actual_state_match() {
+        // User's desired state (single backslash) must equal ClickHouse's stored state
+        // (double backslash) after parsing, to avoid false DROP+CREATE on restart.
+        let desired = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_\\d+$".to_string(),
+        };
+        let actual = ClickhouseEngine::try_from("Merge('local', '^events_\\\\d+$')").unwrap();
+        assert_eq!(desired, actual);
+    }
+
+    #[test]
+    fn test_merge_engine_traits() {
+        let engine = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        assert!(!engine.is_merge_tree_family());
+        assert!(!engine.supports_order_by());
+        assert!(engine.supports_select());
+        assert!(engine.sensitive_settings().is_empty());
+    }
+
+    #[test]
+    fn test_merge_non_alterable_params_hash() {
+        let engine1 = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        let engine2 = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^logs_.*$".to_string(),
+        };
+        let engine3 = ClickhouseEngine::Merge {
+            source_database: "other_db".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        assert_ne!(
+            engine1.non_alterable_params_hash(),
+            engine2.non_alterable_params_hash()
+        );
+        assert_ne!(
+            engine1.non_alterable_params_hash(),
+            engine3.non_alterable_params_hash()
+        );
+        assert_eq!(
+            engine1.non_alterable_params_hash(),
+            engine1.non_alterable_params_hash()
+        );
+    }
+
+    #[test]
+    fn test_merge_parse_malformed_single_quote_source_database() {
+        // Malformed input ClickHouse would never produce. Without the len() >= 2 guard this panics.
+        let _result = ClickhouseEngine::try_from("Merge(', '^test')");
     }
 }

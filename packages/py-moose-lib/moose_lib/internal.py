@@ -253,6 +253,14 @@ class KafkaConfigDict(BaseEngineConfigDict):
     format: str
 
 
+class MergeConfigDict(BaseEngineConfigDict):
+    """Configuration for Merge engine."""
+
+    engine: Literal["Merge"] = "Merge"
+    source_database: str
+    tables_regexp: str
+
+
 # Discriminated union of all engine configurations
 EngineConfigDict = Union[
     MergeTreeConfigDict,
@@ -273,6 +281,7 @@ EngineConfigDict = Union[
     DistributedConfigDict,
     IcebergS3ConfigDict,
     KafkaConfigDict,
+    MergeConfigDict,
 ]
 
 
@@ -501,6 +510,7 @@ class MaterializedViewJson(BaseModel):
         target_table: Name of the target table where data is written.
         target_database: Optional database for the target table.
         metadata: Optional metadata for the materialized view (e.g., description, source file).
+        life_cycle: Optional lifecycle management policy.
     """
 
     model_config = model_config
@@ -512,6 +522,7 @@ class MaterializedViewJson(BaseModel):
     target_table: str
     target_database: Optional[str] = None
     metadata: Optional[dict] = None
+    life_cycle: Optional[str] = None
 
 
 class ViewJson(BaseModel):
@@ -716,7 +727,15 @@ def _convert_engine_instance_to_config_dict(engine: "EngineConfig") -> EngineCon
         DistributedEngine,
         IcebergS3Engine,
         KafkaEngine,
+        MergeEngine,
     )
+
+    # Try Merge
+    if isinstance(engine, MergeEngine):
+        return MergeConfigDict(
+            source_database=engine.source_database,
+            tables_regexp=engine.tables_regexp,
+        )
 
     # Try S3Queue first
     if isinstance(engine, S3QueueEngine):
@@ -1140,6 +1159,7 @@ def to_infra_map() -> dict:
             target_table=mv.target_table.name,
             target_database=getattr(mv.target_table.config, "database", None),
             metadata=getattr(mv, "metadata", None),
+            life_cycle=(mv.life_cycle.value if mv.life_cycle else "FULLY_MANAGED"),
         )
 
     # Serialize custom views with structured data

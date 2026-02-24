@@ -31,6 +31,7 @@ import {
   APP_NAMES,
   CLICKHOUSE_CONFIG,
   TEST_ADMIN_API_KEY_HASH,
+  TEST_ADMIN_BEARER_TOKEN,
 } from "./constants";
 
 import {
@@ -63,6 +64,9 @@ import {
   performGlobalCleanup,
   logger,
   waitForInfrastructureChanges,
+  PlanOutput,
+  getTableChanges,
+  runMoosePlanJson,
 } from "./utils";
 import { triggerWorkflow } from "./utils/workflow-utils";
 import { geoPayloadPy, geoPayloadTs } from "./utils/geo-payload";
@@ -1098,6 +1102,286 @@ const createTemplateTestSuite = (config: TemplateTestConfig) => {
             }
           },
           { attempts: 10, delayMs: 1000 },
+        );
+      });
+
+      it("should plan/apply comment+codec modifications on existing tables", async function () {
+        this.timeout(TIMEOUTS.TEST_SETUP_MS);
+
+        testLogger.info(
+          "Waiting for streaming functions to stabilize after DEFAULT removal...",
+        );
+        await waitForStreamingFunctions(180_000);
+
+        // Verify initial state: columns have correct comment+codec combinations
+        await withRetries(
+          async () => {
+            const ddl = await getTableDDL("CommentCodecTest");
+
+            // data: comment + codec
+            const dataCol = ddl.match(/`data`[^,\n]+/);
+            if (
+              !dataCol ||
+              !dataCol[0].includes("CODEC(ZSTD(3))") ||
+              !dataCol[0].includes("COMMENT 'Raw data payload'")
+            ) {
+              throw new Error(
+                `data column should have ZSTD(3) codec and 'Raw data payload' comment. Match: ${dataCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+
+            // metric: comment + codec
+            const metricCol = ddl.match(/`metric`[^,\n]+/);
+            if (
+              !metricCol ||
+              !metricCol[0].includes("CODEC(ZSTD(1))") ||
+              !metricCol[0].includes("COMMENT 'Measurement value'")
+            ) {
+              throw new Error(
+                `metric column should have ZSTD(1) codec and 'Measurement value' comment. Match: ${metricCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+
+            // label: comment only
+            const labelCol = ddl.match(/`label`[^,\n]+/);
+            if (
+              !labelCol ||
+              !labelCol[0].includes("COMMENT 'Classification label'")
+            ) {
+              throw new Error(
+                `label column should have 'Classification label' comment. Match: ${labelCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+            if (labelCol[0].includes("CODEC")) {
+              throw new Error(
+                `label column should NOT have a codec. Match: ${labelCol[0]}. DDL: ${ddl}`,
+              );
+            }
+
+            // compressed: codec only
+            const compCol = ddl.match(/`compressed`[^,\n]+/);
+            if (!compCol || !compCol[0].includes("CODEC(LZ4)")) {
+              throw new Error(
+                `compressed column should have LZ4 codec. Match: ${compCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+            if (compCol[0].includes("COMMENT")) {
+              throw new Error(
+                `compressed column should NOT have a comment. Match: ${compCol[0]}. DDL: ${ddl}`,
+              );
+            }
+          },
+          { attempts: 10, delayMs: 1000 },
+        );
+
+        // Modify the template file to change comment+codec combinations
+        const engineTestsPath = path.join(
+          TEST_PROJECT_DIR,
+          "src",
+          "ingest",
+          config.language === "typescript" ?
+            "engineTests.ts"
+          : "engine_tests.py",
+        );
+        let contents = await fs.promises.readFile(engineTestsPath, "utf8");
+
+        if (config.language === "typescript") {
+          // Change comment on column with codec
+          contents = contents.replace(
+            "/** Raw data payload */",
+            "/** Updated data payload */",
+          );
+          // Change codec on column with comment
+          contents = contents.replace(
+            'metric: number & ClickHouseCodec<"ZSTD(1)">;',
+            'metric: number & ClickHouseCodec<"ZSTD(3)">;',
+          );
+          // Add codec to column that only had comment
+          contents = contents.replace(
+            "label: string;",
+            'label: string & ClickHouseCodec<"ZSTD(1)">;',
+          );
+          // Add comment to column that only had codec
+          contents = contents.replace(
+            'compressed: string & ClickHouseCodec<"LZ4">;',
+            '/** Compressed data */\n  compressed: string & ClickHouseCodec<"LZ4">;',
+          );
+          // Add a new column with both comment and codec (tests ADD COLUMN path)
+          contents = contents.replace(
+            "}\n\nexport const CommentCodecTable",
+            '  /** Added via column addition */\n  extra: string & ClickHouseCodec<"LZ4">;\n}\n\nexport const CommentCodecTable',
+          );
+        } else {
+          // Change comment on column with codec
+          contents = contents.replace(
+            'description="Raw data payload"',
+            'description="Updated data payload"',
+          );
+          // Change codec on column with comment
+          contents = contents.replace(
+            'Annotated[float, ClickHouseCodec("ZSTD(1)")] = Field(\n        description="Measurement value"\n    )',
+            'Annotated[float, ClickHouseCodec("ZSTD(3)")] = Field(\n        description="Measurement value"\n    )',
+          );
+          // Add codec to column that only had comment
+          contents = contents.replace(
+            'label: str = Field(description="Classification label")',
+            'label: Annotated[str, ClickHouseCodec("ZSTD(1)")] = Field(description="Classification label")',
+          );
+          // Add comment to column that only had codec
+          contents = contents.replace(
+            'compressed: Annotated[str, ClickHouseCodec("LZ4")]',
+            'compressed: Annotated[str, ClickHouseCodec("LZ4")] = Field(description="Compressed data")',
+          );
+          // Add a new column with both comment and codec (tests ADD COLUMN path)
+          contents = contents.replace(
+            "compressed: Annotated[str, ClickHouseCodec",
+            'extra: Annotated[str, ClickHouseCodec("LZ4")] = Field(\n        description="Added via column addition"\n    )\n    compressed: Annotated[str, ClickHouseCodec',
+          );
+        }
+
+        const infrastructureChangesPromise = waitForInfrastructureChanges(
+          devProcess!,
+          60_000,
+        );
+
+        await fs.promises.writeFile(engineTestsPath, contents, "utf8");
+
+        testLogger.info(
+          "Waiting for infrastructure changes after comment+codec modification...",
+        );
+        await infrastructureChangesPromise;
+        testLogger.info("Infrastructure changes completed");
+
+        testLogger.info("Waiting for streaming functions to stabilize...");
+        await waitForStreamingFunctions(180_000);
+        testLogger.info("Streaming functions stabilized");
+
+        // Verify modified state
+        await withRetries(
+          async () => {
+            const ddl = await getTableDDL("CommentCodecTest");
+
+            // data: comment changed, codec kept
+            const dataCol = ddl.match(/`data`[^,\n]+/);
+            if (
+              !dataCol ||
+              !dataCol[0].includes("CODEC(ZSTD(3))") ||
+              !dataCol[0].includes("COMMENT 'Updated data payload'")
+            ) {
+              throw new Error(
+                `data column comment not updated. Match: ${dataCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+
+            // metric: codec changed, comment kept
+            const metricCol = ddl.match(/`metric`[^,\n]+/);
+            if (
+              !metricCol ||
+              !metricCol[0].includes("CODEC(ZSTD(3))") ||
+              !metricCol[0].includes("COMMENT 'Measurement value'")
+            ) {
+              throw new Error(
+                `metric column codec not updated. Match: ${metricCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+
+            // label: codec added, comment kept
+            const labelCol = ddl.match(/`label`[^,\n]+/);
+            if (
+              !labelCol ||
+              !labelCol[0].includes("CODEC(ZSTD(1))") ||
+              !labelCol[0].includes("COMMENT 'Classification label'")
+            ) {
+              throw new Error(
+                `label column should now have both codec and comment. Match: ${labelCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+
+            // compressed: comment added, codec kept
+            const compCol = ddl.match(/`compressed`[^,\n]+/);
+            if (
+              !compCol ||
+              !compCol[0].includes("CODEC(LZ4)") ||
+              !compCol[0].includes("COMMENT 'Compressed data'")
+            ) {
+              throw new Error(
+                `compressed column should now have both codec and comment. Match: ${compCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+
+            // extra: newly added column with both comment and codec (tests ADD COLUMN)
+            const extraCol = ddl.match(/`extra`[^,\n]+/);
+            if (
+              !extraCol ||
+              !extraCol[0].includes("CODEC(LZ4)") ||
+              !extraCol[0].includes("COMMENT 'Added via column addition'")
+            ) {
+              throw new Error(
+                `extra column should have both codec and comment from ADD COLUMN. Match: ${extraCol?.[0]}. DDL: ${ddl}`,
+              );
+            }
+          },
+          { attempts: 10, delayMs: 1000 },
+        );
+      });
+
+      it("should create Merge engine table with correct DDL", async function () {
+        this.timeout(TIMEOUTS.TEST_SETUP_MS);
+
+        await waitForStreamingFunctions(180_000);
+
+        // Verify source tables exist first
+        const sourceADDL = await withRetries(
+          async () => getTableDDL("MergeSourceA", "local"),
+          { attempts: 10, delayMs: 1000, backoffFactor: 1 },
+        );
+        if (!sourceADDL.includes("ENGINE = MergeTree")) {
+          throw new Error(
+            `MergeSourceA should use MergeTree engine. DDL: ${sourceADDL}`,
+          );
+        }
+
+        // Verify the Merge table DDL
+        const mergeDDL = await withRetries(
+          async () => getTableDDL("MergeTest", "local"),
+          { attempts: 10, delayMs: 1000, backoffFactor: 1 },
+        );
+        testLogger.info(`Merge table DDL: ${mergeDDL}`);
+
+        if (!mergeDDL.includes("ENGINE = Merge")) {
+          throw new Error(
+            `MergeTest should use Merge engine. DDL: ${mergeDDL}`,
+          );
+        }
+
+        // ClickHouse resolves currentDatabase() to the literal db name at creation time
+        if (!mergeDDL.includes("Merge('local',")) {
+          throw new Error(
+            `MergeTest Merge engine should reference 'local' database (resolved from currentDatabase()). DDL: ${mergeDDL}`,
+          );
+        }
+
+        if (!mergeDDL.includes("^MergeSource.*")) {
+          throw new Error(
+            `MergeTest should have correct tables_regexp. DDL: ${mergeDDL}`,
+          );
+        }
+
+        // Verify no diff on restart: currentDatabase() must resolve stably so moose
+        // doesn't issue a false DROP+CREATE every time dev starts.
+        const plan = await runMoosePlanJson(TEST_PROJECT_DIR, {
+          pythonVenvDir:
+            config.language === "python" ? TEST_PROJECT_DIR : undefined,
+        });
+        const mergeTableChanges = getTableChanges(plan, "MergeTest");
+        if (mergeTableChanges.length > 0) {
+          throw new Error(
+            `MergeTest should have no diff after startup, but plan shows changes: ${JSON.stringify(mergeTableChanges)}`,
+          );
+        }
+
+        testLogger.info(
+          "Merge engine table created successfully with stable currentDatabase() resolution",
         );
       });
     }

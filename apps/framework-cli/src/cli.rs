@@ -8,6 +8,11 @@ pub mod processing_coordinator;
 pub mod routines;
 use crate::cli::routines::seed_data;
 pub mod settings;
+/// TypeScript compilation watcher: runs `moose-tspc --watch`, parses compile events,
+/// and triggers infrastructure planning/execution on successful incremental builds.
+/// Used in dev mode for TypeScript projects; see `TsCompilationWatcher` and
+/// `spawn_and_await_initial_compile`.
+pub mod ts_compilation_watcher;
 pub mod watcher;
 use super::metrics::Metrics;
 use crate::utilities::{constants, docker::DockerClient};
@@ -238,7 +243,7 @@ pub fn prompt_password(prompt_text: &str) -> Result<String, RoutineFailure> {
   Email:          hello@fiveonefour.com
 
 \x1b[1;4mHOSTING\x1b[0m
-  Try Boreal, Fiveonefour's hosting platform built for MooseStack apps.
+  Try Fiveonefour's hosting platform built for MooseStack apps.
   Sign up for a free trial: https://fiveonefour.boreal.cloud/sign-up"
 )]
 pub struct Cli {
@@ -1161,6 +1166,13 @@ pub async fn top_command_handler(
             json,
         } => {
             info!("Running plan command");
+
+            // Set QUIET_STDOUT early to redirect any messages (like config warnings)
+            // to stderr, keeping stdout clean for JSON output
+            if *json {
+                QUIET_STDOUT.store(true, Ordering::Relaxed);
+            }
+
             let project = load_project(commands)?;
 
             let capture_handle = crate::utilities::capture::capture_usage(
@@ -1591,6 +1603,7 @@ pub async fn top_command_handler(
         }
         Commands::Seed(seed_args) => {
             let project = load_project(commands)?;
+
             seed_data::handle_seed_command(seed_args, &project).await
         }
         Commands::Truncate { tables, all, rows } => {
@@ -1606,6 +1619,7 @@ pub async fn top_command_handler(
                 schema_registry,
             } => {
                 let project = load_project(commands)?;
+
                 let path = path.as_deref().unwrap_or(match project.language {
                     SupportedLanguages::Typescript => "app/external-topics",
                     SupportedLanguages::Python => "app/external_topics",
@@ -1686,8 +1700,8 @@ pub async fn top_command_handler(
                 Some(DocsCommands::Browse {}) => {
                     routines::docs::browse_docs(lang, docs_args.raw, docs_args.web).await
                 }
-                Some(DocsCommands::Search { query }) => {
-                    routines::docs::search_toc(query, docs_args.raw).await
+                Some(DocsCommands::Search { query, expand }) => {
+                    routines::docs::search_toc(query, docs_args.raw, lang, *expand).await
                 }
                 None if docs_args.slug.is_none() => {
                     routines::docs::show_toc(docs_args.expand, docs_args.raw, lang).await

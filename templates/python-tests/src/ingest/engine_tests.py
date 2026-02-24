@@ -7,6 +7,7 @@ from moose_lib import (
     Key,
     Int8,
     ClickHouseTTL,
+    ClickHouseCodec,
     clickhouse_default,
     FixedString,
 )
@@ -24,9 +25,10 @@ from moose_lib.blocks import (
     ReplicatedCollapsingMergeTreeEngine,
     ReplicatedVersionedCollapsingMergeTreeEngine,
     BufferEngine,
+    MergeEngine,
     # S3QueueEngine - requires S3 configuration, tested separately
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Optional, Annotated, List
 
@@ -295,9 +297,55 @@ sample_by_table = OlapTable[EngineTestDataSample](
     ),
 )
 
+
+# Table for testing MODIFY COLUMN with comment + codec combinations
+class CommentCodecTestData(BaseModel):
+    id: Key[str]
+    timestamp: datetime
+    data: Annotated[str, ClickHouseCodec("ZSTD(3)")] = Field(
+        description="Raw data payload"
+    )
+    metric: Annotated[float, ClickHouseCodec("ZSTD(1)")] = Field(
+        description="Measurement value"
+    )
+    label: str = Field(description="Classification label")
+    compressed: Annotated[str, ClickHouseCodec("LZ4")]
+
+
+comment_codec_table = OlapTable[CommentCodecTestData](
+    "CommentCodecTest",
+    OlapConfig(
+        engine=MergeTreeEngine(),
+        order_by_fields=["id", "timestamp"],
+    ),
+)
+
 # Note: S3Queue engine testing is more complex as it requires S3 configuration
 # and external dependencies, so it's not included in this basic engine test suite.
 # For S3Queue testing, see the dedicated S3 integration tests.
+
+# Test Merge engine - virtual read-only view over tables matching a regex
+# Source tables that the Merge table will read from
+merge_source_a = OlapTable[EngineTestData](
+    "MergeSourceA",
+    OlapConfig(engine=MergeTreeEngine(), order_by_fields=["id", "timestamp"]),
+)
+
+merge_source_b = OlapTable[EngineTestData](
+    "MergeSourceB",
+    OlapConfig(engine=MergeTreeEngine(), order_by_fields=["id", "timestamp"]),
+)
+
+# Merge table: reads from all tables matching ^MergeSource.* in the current database
+merge_table = OlapTable[EngineTestData](
+    "MergeTest",
+    OlapConfig(
+        engine=MergeEngine(
+            source_database="currentDatabase()",
+            tables_regexp="^MergeSource.*",
+        )
+    ),
+)
 
 # Test Buffer engine - buffers writes before flushing to destination table
 # First create the destination table
@@ -346,8 +394,12 @@ all_engine_test_tables = [
     replicated_versioned_collapsing_merge_tree_table,
     sample_by_table,
     ttl_table,
+    merge_source_a,
+    merge_source_b,
+    merge_table,
     buffer_destination_table,
     buffer_table,
     default_table,
     fixedstring_table,
+    comment_codec_table,
 ]

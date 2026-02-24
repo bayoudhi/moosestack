@@ -6,6 +6,7 @@ import {
   Int8,
   ClickHouseTTL,
   ClickHouseDefault,
+  ClickHouseCodec,
   UInt32,
 } from "@514labs/moose-lib";
 
@@ -254,6 +255,27 @@ export const SampleByTable = new OlapTable<EngineTestDataSample>(
   },
 );
 
+// Table for testing MODIFY COLUMN with comment + codec combinations
+export interface CommentCodecTestData {
+  id: Key<string>;
+  timestamp: DateTime;
+  /** Raw data payload */
+  data: string & ClickHouseCodec<"ZSTD(3)">;
+  /** Measurement value */
+  metric: number & ClickHouseCodec<"ZSTD(1)">;
+  /** Classification label */
+  label: string;
+  compressed: string & ClickHouseCodec<"LZ4">;
+}
+
+export const CommentCodecTable = new OlapTable<CommentCodecTestData>(
+  "CommentCodecTest",
+  {
+    engine: ClickHouseEngines.MergeTree,
+    orderByFields: ["id", "timestamp"],
+  },
+);
+
 // Note: S3Queue engine testing is more complex as it requires S3 configuration
 // and external dependencies, so it's not included in this basic engine test suite.
 // For S3Queue testing, see the dedicated S3 integration tests.
@@ -282,6 +304,25 @@ export const BufferTable = new OlapTable<EngineTestData>("BufferTest", {
   maxBytes: 104857600,
 });
 
+// Test Merge engine - virtual read-only view over tables matching a regex
+// Source tables that the Merge table will read from
+export const MergeSourceA = new OlapTable<EngineTestData>("MergeSourceA", {
+  engine: ClickHouseEngines.MergeTree,
+  orderByFields: ["id", "timestamp"],
+});
+
+export const MergeSourceB = new OlapTable<EngineTestData>("MergeSourceB", {
+  engine: ClickHouseEngines.MergeTree,
+  orderByFields: ["id", "timestamp"],
+});
+
+// Merge table: reads from all tables matching ^MergeSource.* in the current database
+export const MergeTable = new OlapTable<EngineTestData>("MergeTest", {
+  engine: ClickHouseEngines.Merge,
+  sourceDatabase: "currentDatabase()",
+  tablesRegexp: "^MergeSource.*",
+});
+
 /**
  * Export all test tables for verification that engine configurations
  * can be properly instantiated and don't throw errors during table creation.
@@ -306,7 +347,11 @@ export const allEngineTestTables = [
   ReplicatedVersionedCollapsingMergeTreeTable,
   SampleByTable,
   TTLTable,
+  MergeSourceA,
+  MergeSourceB,
+  MergeTable,
   BufferDestinationTable,
   BufferTable,
   DefaultTable,
+  CommentCodecTable,
 ];

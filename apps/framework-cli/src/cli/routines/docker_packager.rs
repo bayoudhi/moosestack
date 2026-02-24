@@ -142,7 +142,7 @@ RUN npx moose check
 
 # Pre-compile TypeScript with moose plugins (typia, compilerPlugin)
 # This eliminates ts-node overhead at runtime for faster worker startup
-RUN MOOSE_SOURCE_DIR='{}' npx moose-tspc .moose/compiled
+RUN MOOSE_SOURCE_DIR='{}' npx moose-tspc
 
 # Set environment variable to use pre-compiled JavaScript at runtime
 ENV MOOSE_USE_COMPILED=true"#,

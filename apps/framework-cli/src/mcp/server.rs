@@ -1,7 +1,7 @@
 use rmcp::{
     model::{
-        CallToolRequestParam, CallToolResult, Implementation, ListToolsResult,
-        PaginatedRequestParam, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -62,6 +62,7 @@ impl ServerHandler for MooseMcpHandler {
                 name: self.server_name.clone(),
                 version: self.server_version.clone(),
                 title: Some("Moose MCP Server".to_string()),
+                description: None,
                 icons: None,
                 website_url: None,
             },
@@ -74,10 +75,11 @@ impl ServerHandler for MooseMcpHandler {
 
     async fn list_tools(
         &self,
-        _pagination: Option<PaginatedRequestParam>,
+        _pagination: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
+            meta: None,
             tools: vec![
                 logs::tool_definition(),
                 infra_map::tool_definition(),
@@ -91,12 +93,15 @@ impl ServerHandler for MooseMcpHandler {
 
     async fn call_tool(
         &self,
-        param: CallToolRequestParam,
+        param: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Wait for any in-progress file watcher processing to complete
-        // This ensures we read stable infrastructure state
-        self.processing_coordinator.wait_for_stable_state().await;
+        // Hold a read guard for the full tool execution so watcher mutations
+        // cannot interleave with MCP operations.
+        let _stable_state_guard = self
+            .processing_coordinator
+            .acquire_stable_state_guard()
+            .await;
 
         match param.name.as_ref() {
             "get_logs" => Ok(logs::handle_call(param.arguments.as_ref())),
@@ -157,7 +162,9 @@ pub fn create_mcp_http_service(
         // keep alive low so that we can shut down the server when we're done
         // and that it doesn't hang around forever
         sse_keep_alive: Some(std::time::Duration::from_secs(1)),
-        stateful_mode: true,
+        // Stateless mode avoids sticky session behavior across local dev server restarts.
+        stateful_mode: false,
+        ..Default::default()
     };
 
     StreamableHttpService::new(
