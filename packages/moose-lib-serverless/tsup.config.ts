@@ -328,8 +328,8 @@ export interface ClickHouseConfig {
   username: string;
   /** ClickHouse password */
   password: string;
-  /** ClickHouse database name */
-  database: string;
+  /** ClickHouse database name (optional — only needed if your OlapTable configs don't specify \`database\`) */
+  database?: string;
   /** Whether to use HTTPS/SSL for the connection */
   useSSL: boolean;
 }

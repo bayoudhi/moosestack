@@ -100,7 +100,7 @@ configureClickHouse({
   port: process.env.CLICKHOUSE_PORT!,       // string, e.g. "8443"
   username: process.env.CLICKHOUSE_USER!,
   password: process.env.CLICKHOUSE_PASSWORD!,
-  database: process.env.CLICKHOUSE_DATABASE!,
+  database: process.env.CLICKHOUSE_DATABASE, // optional — only if your OlapTable configs don't specify `database`
   useSSL: true,
 });
 
@@ -122,7 +122,7 @@ export async function handler(event: any) {
 | `port` | `string` | `"8443"` |
 | `username` | `string` | `"default"` |
 | `password` | `string` | `"secret"` |
-| `database` | `string` | `"my_database"` |
+| `database` | `string?` | `"my_database"` (optional — only needed if your OlapTable configs don't specify `database`) |
 | `useSSL` | `boolean` | `true` |
 
 ## What's Included
