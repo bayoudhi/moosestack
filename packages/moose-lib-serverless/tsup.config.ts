@@ -171,6 +171,16 @@ const patchedMooseTspc: Plugin = {
           "(0, import_child_process.spawn)(process.execPath,",
         );
 
+        // Strip --sourceMap and --inlineSources CLI flags from tspcArgs.
+        // The upstream moose-tspc hardcodes these flags, but they conflict with
+        // projects that set inlineSourceMap: true in their tsconfig.json (TS5053).
+        // The user's tsconfig already specifies their preferred source map strategy,
+        // so moose-tspc shouldn't override it.
+        contents = contents.replace(
+          /\s*"--sourceMap",\s*"--inlineSources",?/g,
+          "",
+        );
+
         return { contents, loader: "js" };
       },
     );

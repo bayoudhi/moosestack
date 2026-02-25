@@ -1,6 +1,6 @@
 {
   "name": "@bayoudhi/moose-lib-serverless",
-  "version": "0.7.10",
+  "version": "0.7.11",
   "description": "Serverless-compatible subset of @514labs/moose-lib for AWS Lambda and edge runtimes. Provides OlapTable, Stream, Workflow, View, and other Moose SDK classes without native C++ dependencies (Kafka, Temporal). Includes a patched compiler plugin for type-driven schema injection.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
