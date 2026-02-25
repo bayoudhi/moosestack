@@ -114,6 +114,39 @@ const patchedCompilerPlugin: Plugin = {
           'location.includes("@514labs/moose-lib") || location.includes("@bayoudhi/moose-lib-serverless")',
         );
 
+        // Patch createTransformer to use ts-patch's host TypeScript instance.
+        //
+        // The upstream plugin does `require("typescript")` 7 times, producing
+        // import_typescript, import_typescript2, ..., import_typescript7. In pnpm
+        // workspaces these can resolve to a DIFFERENT TypeScript version than the
+        // one ts-patch loaded, causing SyntaxKind enum mismatches and silent
+        // transformation failures ("Supply the type param T").
+        //
+        // ts-patch passes `TransformerExtras { ts: typeof ts }` as the third
+        // argument to the plugin factory (named `_extrasOrConfig` in the compiled
+        // output). We inject code right after the `maybeProgramExtras` guard to
+        // reassign all import_typescript* variables to use `_extrasOrConfig.ts`
+        // — the exact TypeScript instance ts-patch is using.
+        contents = contents.replace(
+          "const transformFunction = transform2(program.getTypeChecker(), program);",
+          [
+            "// [moose-lib-serverless] Use ts-patch's host TypeScript instance",
+            "// to avoid version mismatches in pnpm workspaces.",
+            "if (_extrasOrConfig && _extrasOrConfig.ts) {",
+            "  var _hostTs = { default: _extrasOrConfig.ts, __esModule: true };",
+            "  Object.keys(_extrasOrConfig.ts).forEach(function(k) { _hostTs[k] = _extrasOrConfig.ts[k]; });",
+            "  import_typescript = _hostTs;",
+            "  import_typescript2 = _hostTs;",
+            "  import_typescript3 = _hostTs;",
+            "  import_typescript4 = _hostTs;",
+            "  import_typescript5 = _hostTs;",
+            "  import_typescript6 = _hostTs;",
+            "  import_typescript7 = _hostTs;",
+            "}",
+            "const transformFunction = transform2(program.getTypeChecker(), program);",
+          ].join("\n"),
+        );
+
         return { contents, loader: "js" };
       },
     );
