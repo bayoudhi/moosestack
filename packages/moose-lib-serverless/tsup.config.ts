@@ -152,6 +152,25 @@ const patchedMooseTspc: Plugin = {
           'require.resolve("@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js")',
         );
 
+        // Patch npx tspc invocations to use direct node + resolved tspc path.
+        // In pnpm workspaces, `npx tspc` fails because pnpm's strict hoisting
+        // doesn't place tspc where npx expects it. Instead, we:
+        //   1. Replace "npx" with process.execPath (current node binary)
+        //   2. Replace "tspc" (first arg) with require.resolve("ts-patch/bin/tspc.js")
+        // This makes invocations: node /resolved/path/to/tspc.js -p tsconfig ...
+        contents = contents.replaceAll(
+          '"tspc",',
+          'require.resolve("ts-patch/bin/tspc.js"),',
+        );
+        contents = contents.replace(
+          '(0, import_child_process.execFileSync)("npx",',
+          "(0, import_child_process.execFileSync)(process.execPath,",
+        );
+        contents = contents.replace(
+          '(0, import_child_process.spawn)("npx",',
+          "(0, import_child_process.spawn)(process.execPath,",
+        );
+
         return { contents, loader: "js" };
       },
     );
