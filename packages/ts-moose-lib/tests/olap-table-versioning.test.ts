@@ -29,6 +29,7 @@ const createMockColumns = (fields: string[]): Column[] =>
     ttl: null,
     codec: null,
     materialized: null,
+    alias: null,
     annotations: [],
     comment: null,
   }));
@@ -66,8 +67,17 @@ interface UserEventV2 {
 
 describe("OlapTable Versioning", () => {
   beforeEach(() => {
-    // Clear registries before each test
-    getMooseInternal().tables.clear();
+    // Clear full registry to keep tests isolated from other suites.
+    const registry = getMooseInternal();
+    registry.tables.clear();
+    registry.streams.clear();
+    registry.ingestApis.clear();
+    registry.apis.clear();
+    registry.sqlResources.clear();
+    registry.workflows.clear();
+    registry.webApps.clear();
+    registry.materializedViews.clear();
+    registry.views.clear();
   });
 
   describe("Multiple Table Versions", () => {

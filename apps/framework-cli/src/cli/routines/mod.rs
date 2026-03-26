@@ -165,6 +165,7 @@ pub mod auth;
 pub mod build;
 pub mod clean;
 pub mod code_generation;
+pub mod components;
 pub mod dev;
 pub mod docker_packager;
 pub(crate) mod docs;
@@ -652,7 +653,12 @@ pub async fn start_development_mode(
 
                     let changed = externally_managed.iter().any(|t| {
                         if let Some(remote_table) = tables.get(&t.name) {
-                            !compute_table_columns_diff(t, remote_table).is_empty()
+                            !compute_table_columns_diff(
+                                t,
+                                remote_table,
+                                &project.migration_config.ignore_operations,
+                            )
+                            .is_empty()
                                 || !remote_table.order_by_equals(t)
                                 || t.engine != remote_table.engine
                         } else {
@@ -950,7 +956,7 @@ pub async fn start_production_mode(
     let (current_state, plan) = plan_changes(&*state_storage, &project).await?;
     maybe_warmup_connections(&project, &redis_client).await;
 
-    let execute_migration_yaml = project.features.ddl_plan && std::fs::exists(MIGRATION_FILE)?;
+    let execute_migration_yaml = std::fs::exists(MIGRATION_FILE)?;
 
     if execute_migration_yaml {
         migrate::execute_migration_plan(

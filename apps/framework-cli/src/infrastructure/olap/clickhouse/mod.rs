@@ -34,7 +34,7 @@ use clickhouse::Client;
 
 use errors::{validate_clickhouse_identifier, ClickhouseError};
 use mapper::{std_column_to_clickhouse_column, std_table_to_clickhouse_table};
-use model::ClickHouseColumn;
+use model::{ClickHouseColumn, ColumnPropertyRemovals, DefaultExpressionKind};
 use queries::ClickhouseEngine;
 use queries::{
     alter_table_modify_settings_query, alter_table_reset_settings_query,
@@ -43,22 +43,25 @@ use queries::{
 use serde::{Deserialize, Serialize};
 use sql_parser::{
     extract_engine_from_create_table, extract_indexes_from_create_table,
-    extract_primary_key_from_create_table, extract_sample_by_from_create_table,
-    extract_source_tables_from_query, extract_source_tables_from_query_regex,
-    extract_table_settings_from_create_table, normalize_sql_for_comparison, split_qualified_name,
+    extract_primary_key_from_create_table, extract_projections_from_create_table,
+    extract_sample_by_from_create_table, extract_source_tables_from_query,
+    extract_source_tables_from_query_regex, extract_table_settings_from_create_table,
+    normalize_sql_for_comparison, split_qualified_name,
 };
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
 use std::sync::LazyLock;
 use tracing::{debug, info, instrument, warn};
 
 use crate::cli::logger::{context, resource_type};
 
 use self::model::ClickHouseSystemTable;
+use crate::framework::core::infrastructure::select_row_policy::{
+    SelectRowPolicy, TableReference, MOOSE_RLS_ROLE,
+};
 use crate::framework::core::infrastructure::sql_resource::SqlResource;
 use crate::framework::core::infrastructure::table::{
     Column, ColumnMetadata, ColumnType, DataEnum, EnumMember, EnumValue, EnumValueMetadata,
-    OrderBy, Table, TableIndex, METADATA_PREFIX,
+    OrderBy, Table, TableIndex, TableProjection, METADATA_PREFIX,
 };
 use crate::framework::core::infrastructure::InfrastructureSignature;
 use crate::framework::core::infrastructure_map::{PrimitiveSignature, PrimitiveTypes};
@@ -216,6 +219,24 @@ pub enum SerializableOlapOperation {
         /// Optional cluster name for ON CLUSTER support
         cluster_name: Option<String>,
     },
+    /// Add a projection (alternative data ordering) to an existing MergeTree-family table.
+    AddTableProjection {
+        table: String,
+        projection: TableProjection,
+        /// The database containing the table (None means use primary database)
+        database: Option<String>,
+        /// Optional cluster name for ON CLUSTER support
+        cluster_name: Option<String>,
+    },
+    /// Drop a projection from an existing table by name.
+    DropTableProjection {
+        table: String,
+        projection_name: String,
+        /// The database containing the table (None means use primary database)
+        database: Option<String>,
+        /// Optional cluster name for ON CLUSTER support
+        cluster_name: Option<String>,
+    },
     ModifySampleBy {
         table: String,
         expression: String,
@@ -272,6 +293,12 @@ pub enum SerializableOlapOperation {
         sql: Vec<String>,
         description: String,
     },
+    /// Create row policies on one or more tables.
+    /// Bootstrap SQL (role, user, grants) is generated at execution time
+    /// using the runtime password — never serialized.
+    CreateRowPolicy { policy: SelectRowPolicy },
+    /// Drop row policies from one or more tables.
+    DropRowPolicy { policy: SelectRowPolicy },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -280,6 +307,7 @@ pub enum IgnorableOperation {
     ModifyTableTtl,
     ModifyColumnTtl,
     ModifyPartitionBy,
+    IgnoreStringLowCardinalityDifferences,
 }
 
 impl IgnorableOperation {
@@ -306,11 +334,14 @@ impl IgnorableOperation {
 /// # Returns
 /// A new table with ignored fields stripped/normalized to match the "before" state
 pub fn normalize_table_for_diff(table: &Table, ignore_ops: &[IgnorableOperation]) -> Table {
-    if ignore_ops.is_empty() {
-        return table.clone();
-    }
-
     let mut normalized = table.clone();
+
+    // seed_filter is a dev-time seeding directive, never part of ClickHouse schema
+    normalized.seed_filter = Default::default();
+
+    if ignore_ops.is_empty() {
+        return normalized;
+    }
 
     // Strip table-level TTL if ignored
     if ignore_ops.contains(&IgnorableOperation::ModifyTableTtl) {
@@ -329,6 +360,17 @@ pub fn normalize_table_for_diff(table: &Table, ignore_ops: &[IgnorableOperation]
         }
     }
 
+    // Strip LowCardinality annotations if ignored (only for String-typed columns)
+    if ignore_ops.contains(&IgnorableOperation::IgnoreStringLowCardinalityDifferences) {
+        for column in &mut normalized.columns {
+            if column.data_type == ColumnType::String {
+                column
+                    .annotations
+                    .retain(|(key, _)| key != "LowCardinality");
+            }
+        }
+    }
+
     normalized
 }
 
@@ -344,6 +386,8 @@ fn extract_cluster_name(op: &AtomicOlapOperation) -> Option<&str> {
         | AtomicOlapOperation::ModifyTableTtl { table, .. }
         | AtomicOlapOperation::AddTableIndex { table, .. }
         | AtomicOlapOperation::DropTableIndex { table, .. }
+        | AtomicOlapOperation::AddTableProjection { table, .. }
+        | AtomicOlapOperation::DropTableProjection { table, .. }
         | AtomicOlapOperation::ModifySampleBy { table, .. }
         | AtomicOlapOperation::RemoveSampleBy { table, .. } => table.cluster_name.as_deref(),
         AtomicOlapOperation::PopulateMaterializedView { .. }
@@ -354,7 +398,9 @@ fn extract_cluster_name(op: &AtomicOlapOperation) -> Option<&str> {
         | AtomicOlapOperation::CreateMaterializedView { .. }
         | AtomicOlapOperation::DropMaterializedView { .. }
         | AtomicOlapOperation::CreateView { .. }
-        | AtomicOlapOperation::DropView { .. } => None,
+        | AtomicOlapOperation::DropView { .. }
+        | AtomicOlapOperation::CreateRowPolicy { .. }
+        | AtomicOlapOperation::DropRowPolicy { .. } => None,
     }
 }
 
@@ -537,6 +583,24 @@ pub fn describe_operation(operation: &SerializableOlapOperation) -> String {
         } => {
             format!("Dropping index '{}' from table '{}'", index_name, table)
         }
+        SerializableOlapOperation::AddTableProjection {
+            table, projection, ..
+        } => {
+            format!(
+                "Adding projection '{}' to table '{}'",
+                projection.name, table
+            )
+        }
+        SerializableOlapOperation::DropTableProjection {
+            table,
+            projection_name,
+            ..
+        } => {
+            format!(
+                "Dropping projection '{}' from table '{}'",
+                projection_name, table
+            )
+        }
         SerializableOlapOperation::ModifySampleBy {
             table, expression, ..
         } => {
@@ -573,6 +637,12 @@ pub fn describe_operation(operation: &SerializableOlapOperation) -> String {
             format!("Dropping custom view '{}'", name)
         }
         SerializableOlapOperation::RawSql { description, .. } => description.clone(),
+        SerializableOlapOperation::CreateRowPolicy { policy } => {
+            format!("Creating row policy '{}'", policy.name)
+        }
+        SerializableOlapOperation::DropRowPolicy { policy } => {
+            format!("Dropping row policy '{}'", policy.name)
+        }
     }
 }
 
@@ -746,6 +816,38 @@ pub async fn execute_atomic_operation(
             )
             .await?;
         }
+        SerializableOlapOperation::AddTableProjection {
+            table,
+            projection,
+            database,
+            cluster_name,
+        } => {
+            let target_db = database.as_deref().unwrap_or(db_name);
+            execute_add_table_projection(
+                target_db,
+                table,
+                projection,
+                cluster_name.as_deref(),
+                client,
+            )
+            .await?;
+        }
+        SerializableOlapOperation::DropTableProjection {
+            table,
+            projection_name,
+            database,
+            cluster_name,
+        } => {
+            let target_db = database.as_deref().unwrap_or(db_name);
+            execute_drop_table_projection(
+                target_db,
+                table,
+                projection_name,
+                cluster_name.as_deref(),
+                client,
+            )
+            .await?;
+        }
         SerializableOlapOperation::ModifySampleBy {
             table,
             expression,
@@ -803,6 +905,12 @@ pub async fn execute_atomic_operation(
         }
         SerializableOlapOperation::RawSql { sql, description } => {
             execute_raw_sql(sql, description, client).await?;
+        }
+        SerializableOlapOperation::CreateRowPolicy { policy } => {
+            execute_create_row_policy(db_name, policy, client).await?;
+        }
+        SerializableOlapOperation::DropRowPolicy { policy } => {
+            execute_drop_row_policy(db_name, policy, client).await?;
         }
     }
     Ok(())
@@ -884,6 +992,62 @@ async fn execute_drop_table_index(
     let sql = format!(
         "ALTER TABLE `{}`.`{}`{} DROP INDEX `{}`",
         db_name, table_name, cluster_clause, index_name
+    );
+    run_query(&sql, client)
+        .await
+        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+            error: e,
+            resource: Some(table_name.to_string()),
+        })
+}
+
+async fn execute_add_table_projection(
+    db_name: &str,
+    table_name: &str,
+    projection: &TableProjection,
+    cluster_name: Option<&str>,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    validate_clickhouse_identifier(db_name, "Database name")
+        .map_err(ClickhouseChangesError::Clickhouse)?;
+    validate_clickhouse_identifier(table_name, "Table name")
+        .map_err(ClickhouseChangesError::Clickhouse)?;
+    validate_clickhouse_identifier(&projection.name, "Projection name")
+        .map_err(ClickhouseChangesError::Clickhouse)?;
+    let cluster_clause = cluster_name
+        .map(|c| format!(" ON CLUSTER `{}`", c))
+        .unwrap_or_default();
+    let sql = format!(
+        "ALTER TABLE `{}`.`{}`{} ADD PROJECTION IF NOT EXISTS `{}` ({})",
+        db_name, table_name, cluster_clause, projection.name, projection.body
+    );
+    run_query(&sql, client)
+        .await
+        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+            error: e,
+            resource: Some(table_name.to_string()),
+        })
+}
+
+async fn execute_drop_table_projection(
+    db_name: &str,
+    table_name: &str,
+    projection_name: &str,
+    cluster_name: Option<&str>,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    validate_clickhouse_identifier(db_name, "Database name")
+        .map_err(ClickhouseChangesError::Clickhouse)?;
+    validate_clickhouse_identifier(table_name, "Table name")
+        .map_err(ClickhouseChangesError::Clickhouse)?;
+    validate_clickhouse_identifier(projection_name, "Projection name")
+        .map_err(ClickhouseChangesError::Clickhouse)?;
+    let cluster_clause = cluster_name
+        .map(|c| format!(" ON CLUSTER `{}`", c))
+        .unwrap_or_default();
+    let sql = format!(
+        "ALTER TABLE `{}`.`{}`{} DROP PROJECTION IF EXISTS `{}`",
+        db_name, table_name, cluster_clause, projection_name
     );
     run_query(&sql, client)
         .await
@@ -1094,6 +1258,7 @@ async fn execute_modify_table_column(
     let data_type_changed = before_column.data_type != after_column.data_type;
     let default_changed = before_column.default != after_column.default;
     let materialized_changed = before_column.materialized != after_column.materialized;
+    let alias_changed = before_column.alias != after_column.alias;
     let required_changed = before_column.required != after_column.required;
     let comment_changed = before_column.comment != after_column.comment;
     let ttl_changed = before_column.ttl != after_column.ttl;
@@ -1105,6 +1270,7 @@ async fn execute_modify_table_column(
         && !required_changed
         && !default_changed
         && !materialized_changed
+        && !alias_changed
         && !ttl_changed
         && !codec_changed
         && comment_changed
@@ -1145,7 +1311,7 @@ async fn execute_modify_table_column(
 
     tracing::info!(
         "Executing ModifyTableColumn for table: {}, column: {} ({}→{})\
-data_type_changed: {data_type_changed}, default_changed: {default_changed}, materialized_changed: {materialized_changed}, required_changed: {required_changed}, comment_changed: {comment_changed}, ttl_changed: {ttl_changed}, codec_changed: {codec_changed}",
+data_type_changed: {data_type_changed}, default_changed: {default_changed}, materialized_changed: {materialized_changed}, alias_changed: {alias_changed}, required_changed: {required_changed}, comment_changed: {comment_changed}, ttl_changed: {ttl_changed}, codec_changed: {codec_changed}",
         table_name,
         after_column.name,
         before_column.data_type,
@@ -1155,20 +1321,23 @@ data_type_changed: {data_type_changed}, default_changed: {default_changed}, mate
     // Full column modification including type change
     let clickhouse_column = std_column_to_clickhouse_column(after_column.clone())?;
 
-    // Build all the SQL statements needed (main modify + optional removes)
-    let removing_default = before_column.default.is_some() && after_column.default.is_none();
-    let removing_materialized =
-        before_column.materialized.is_some() && after_column.materialized.is_none();
-    let removing_ttl = before_column.ttl.is_some() && after_column.ttl.is_none();
-    let removing_codec = before_column.codec.is_some() && after_column.codec.is_none();
+    let before_kind = column_default_expression_kind(before_column);
+    let after_kind = column_default_expression_kind(after_column);
+    let removing_default_expr = match (before_kind, after_kind) {
+        (Some(kind), other) if other != Some(kind) => Some(kind),
+        _ => None,
+    };
+
+    let removals = ColumnPropertyRemovals {
+        default_expression: removing_default_expr,
+        ttl: before_column.ttl.is_some() && after_column.ttl.is_none(),
+        codec: before_column.codec.is_some() && after_column.codec.is_none(),
+    };
     let queries = build_modify_column_sql(
         db_name,
         table_name,
         &clickhouse_column,
-        removing_default,
-        removing_materialized,
-        removing_ttl,
-        removing_codec,
+        &removals,
         cluster_name,
     )?;
 
@@ -1217,21 +1386,27 @@ async fn execute_modify_column_comment(
     Ok(())
 }
 
+/// Extracts the default expression kind from a core `Column` struct.
+///
+/// Bridges the three `Option<String>` fields on `Column` to `DefaultExpressionKind`
+/// without making the core framework depend on ClickHouse types.
+fn column_default_expression_kind(col: &Column) -> Option<DefaultExpressionKind> {
+    match (&col.default, &col.materialized, &col.alias) {
+        (Some(_), None, None) => Some(DefaultExpressionKind::Default),
+        (None, Some(_), None) => Some(DefaultExpressionKind::Materialized),
+        (None, None, Some(_)) => Some(DefaultExpressionKind::Alias),
+        _ => None,
+    }
+}
+
 /// Builds column property clauses in ClickHouse grammar order:
-/// DEFAULT/MATERIALIZED → COMMENT → CODEC → TTL
+/// DEFAULT/MATERIALIZED/ALIAS → COMMENT → CODEC → TTL
 ///
 /// Used by ADD COLUMN and MODIFY COLUMN to ensure consistent clause ordering.
 fn build_column_property_clauses(col: &ClickHouseColumn) -> String {
-    let default_clause = col
-        .default
-        .as_ref()
-        .map(|d| format!(" DEFAULT {}", d))
-        .unwrap_or_default();
-
-    let materialized_clause = col
-        .materialized
-        .as_ref()
-        .map(|m| format!(" MATERIALIZED {}", m))
+    let default_expr_clause = col
+        .default_expression()
+        .map(|(kind, expr)| format!(" {kind} {expr}"))
         .unwrap_or_default();
 
     let comment_clause = col
@@ -1256,20 +1431,16 @@ fn build_column_property_clauses(col: &ClickHouseColumn) -> String {
         .unwrap_or_default();
 
     format!(
-        "{}{}{}{}{}",
-        default_clause, materialized_clause, comment_clause, codec_clause, ttl_clause
+        "{}{}{}{}",
+        default_expr_clause, comment_clause, codec_clause, ttl_clause
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_modify_column_sql(
     db_name: &str,
     table_name: &str,
     ch_col: &ClickHouseColumn,
-    removing_default: bool,
-    removing_materialized: bool,
-    removing_ttl: bool,
-    removing_codec: bool,
+    removals: &ColumnPropertyRemovals,
     cluster_name: Option<&str>,
 ) -> Result<Vec<String>, ClickhouseChangesError> {
     let column_type_string = basic_field_type_to_string(&ch_col.column_type)?;
@@ -1280,33 +1451,23 @@ fn build_modify_column_sql(
 
     let mut statements = vec![];
 
-    // Add REMOVE DEFAULT statement if needed
-    // ClickHouse doesn't allow mixing column properties with REMOVE clauses
-    if removing_default {
+    // ClickHouse doesn't allow mixing column properties with REMOVE clauses,
+    // so REMOVE statements must be separate ALTER TABLE statements.
+    if let Some(kind) = removals.default_expression {
         statements.push(format!(
-            "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE DEFAULT",
-            db_name, table_name, cluster_clause, ch_col.name
+            "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE {}",
+            db_name, table_name, cluster_clause, ch_col.name, kind
         ));
     }
 
-    // Add REMOVE MATERIALIZED statement if needed
-    if removing_materialized {
-        statements.push(format!(
-            "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE MATERIALIZED",
-            db_name, table_name, cluster_clause, ch_col.name
-        ));
-    }
-
-    // Add REMOVE TTL statement if needed
-    if removing_ttl {
+    if removals.ttl {
         statements.push(format!(
             "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE TTL",
             db_name, table_name, cluster_clause, ch_col.name
         ));
     }
 
-    // Add REMOVE CODEC statement if needed
-    if removing_codec {
+    if removals.codec {
         statements.push(format!(
             "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE CODEC",
             db_name, table_name, cluster_clause, ch_col.name
@@ -1315,7 +1476,6 @@ fn build_modify_column_sql(
 
     let property_clauses = build_column_property_clauses(ch_col);
 
-    // Build the main MODIFY COLUMN statement
     let main_sql = format!(
         "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN IF EXISTS `{}` {}{}",
         db_name, table_name, cluster_clause, ch_col.name, column_type_string, property_clauses
@@ -1471,6 +1631,163 @@ async fn execute_raw_sql(
                     resource: None,
                 })?;
         }
+    }
+    Ok(())
+}
+
+/// Ensures the RLS access-control infrastructure (role, user, grants, policy targeting)
+/// matches the current config. Runs once per startup when any row policies are configured,
+/// regardless of whether the policies themselves changed.
+pub async fn rls_bootstrap(
+    project: &Project,
+    desired_policies: &[SelectRowPolicy],
+) -> Result<(), ClickhouseChangesError> {
+    let client = create_client(project.clickhouse_config.clone());
+    check_ready(&client)
+        .await
+        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+            error: e,
+            resource: None,
+        })?;
+    let db_name = &project.clickhouse_config.db_name;
+    let rls_user = client.config.effective_rls_user();
+    let escaped_rls_user = rls_user.replace('`', "``");
+    let escaped_password = client.config.effective_rls_password().replace('\'', "''");
+
+    tracing::info!(
+        "Running RLS bootstrap for {} policies",
+        desired_policies.len()
+    );
+
+    // 1. Role + user (ALTER ensures password stays in sync if rotated)
+    let bootstrap_sqls = vec![
+        format!("CREATE ROLE IF NOT EXISTS `{MOOSE_RLS_ROLE}`"),
+        format!(
+            "CREATE USER IF NOT EXISTS `{escaped_rls_user}` IDENTIFIED BY '{escaped_password}'"
+        ),
+        format!("ALTER USER `{escaped_rls_user}` IDENTIFIED BY '{escaped_password}'"),
+    ];
+    for sql in &bootstrap_sqls {
+        run_query(sql, &client)
+            .await
+            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+                error: e,
+                resource: Some("rls-bootstrap".to_string()),
+            })?;
+    }
+
+    // 2. Collect all databases that have policies and grant SELECT
+    let mut all_databases: HashSet<String> = HashSet::new();
+    for policy in desired_policies {
+        for db in policy.resolved_databases(db_name) {
+            all_databases.insert(db);
+        }
+    }
+    for db in &all_databases {
+        let escaped_db = db.replace('`', "``");
+        let grant_sql = format!("GRANT SELECT ON `{escaped_db}`.* TO `{escaped_rls_user}`");
+        tracing::debug!("RLS grant: {}", grant_sql);
+        run_query(&grant_sql, &client).await.map_err(|e| {
+            ClickhouseChangesError::ClickhouseClient {
+                error: e,
+                resource: Some(format!("rls-grant:{db}")),
+            }
+        })?;
+    }
+
+    // 3. Grant role to user
+    let grant_role_sql = format!("GRANT `{MOOSE_RLS_ROLE}` TO `{escaped_rls_user}`");
+    run_query(&grant_role_sql, &client).await.map_err(|e| {
+        ClickhouseChangesError::ClickhouseClient {
+            error: e,
+            resource: Some("rls-grant-role".to_string()),
+        }
+    })?;
+
+    // 4. Re-point all policies to the current role name, in case it changed.
+    for policy in desired_policies {
+        let escaped_name = policy.name.replace('`', "``");
+        for table_ref in &policy.tables {
+            let db = table_ref.database.as_deref().unwrap_or(db_name);
+            let escaped_db = db.replace('`', "``");
+            let escaped_table = table_ref.name.replace('`', "``");
+            let sql = format!(
+                "ALTER ROW POLICY IF EXISTS `{name}_on_{table}` ON `{db}`.`{table}` TO `{MOOSE_RLS_ROLE}`",
+                name = escaped_name,
+                table = escaped_table,
+                db = escaped_db,
+            );
+            tracing::debug!("RLS ensure policy targeting: {}", sql);
+            run_query(&sql, &client).await.map_err(|e| {
+                ClickhouseChangesError::ClickhouseClient {
+                    error: e,
+                    resource: Some(format!(
+                        "rls-alter-policy:{}:{}",
+                        policy.name, table_ref.name
+                    )),
+                }
+            })?;
+        }
+    }
+
+    tracing::info!("RLS bootstrap complete");
+    Ok(())
+}
+
+/// Execute a CREATE ROW POLICY operation (for new or changed policies only).
+async fn execute_create_row_policy(
+    db_name: &str,
+    policy: &SelectRowPolicy,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    let escaped_name = policy.name.replace('`', "``");
+    for table_ref in &policy.tables {
+        let db = table_ref.database.as_deref().unwrap_or(db_name);
+        let escaped_db = db.replace('`', "``");
+        let escaped_table = table_ref.name.replace('`', "``");
+        let sql = format!(
+            "CREATE ROW POLICY IF NOT EXISTS `{name}_on_{table}` ON `{db}`.`{table}` USING {using} AS RESTRICTIVE TO `{MOOSE_RLS_ROLE}`",
+            name = escaped_name,
+            table = escaped_table,
+            db = escaped_db,
+            using = policy.using_expr(),
+        );
+        tracing::debug!("Creating row policy: {}", sql);
+        run_query(&sql, client)
+            .await
+            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+                error: e,
+                resource: Some(format!("row-policy:{}:{}", policy.name, table_ref.name)),
+            })?;
+    }
+
+    Ok(())
+}
+
+/// Execute a DROP ROW POLICY operation.
+async fn execute_drop_row_policy(
+    db_name: &str,
+    policy: &SelectRowPolicy,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    let escaped_name = policy.name.replace('`', "``");
+    for table_ref in &policy.tables {
+        let db = table_ref.database.as_deref().unwrap_or(db_name);
+        let escaped_db = db.replace('`', "``");
+        let escaped_table = table_ref.name.replace('`', "``");
+        let sql = format!(
+            "DROP ROW POLICY IF EXISTS `{name}_on_{table}` ON `{db}`.`{table}`",
+            name = escaped_name,
+            table = escaped_table,
+            db = escaped_db,
+        );
+        tracing::debug!("Dropping row policy: {}", sql);
+        run_query(&sql, client)
+            .await
+            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+                error: e,
+                resource: Some(format!("row-policy:{}:{}", policy.name, table_ref.name)),
+            })?;
     }
     Ok(())
 }
@@ -1747,24 +2064,39 @@ pub struct ConfiguredDBClient {
 /// });
 /// ```
 pub fn create_client(clickhouse_config: ClickHouseConfig) -> ConfiguredDBClient {
+    let mut client = create_base_client(&clickhouse_config);
+    client = client
+        .with_option("enable_json_type", "1")
+        .with_option("flatten_nested", "0");
+    ConfiguredDBClient {
+        client,
+        config: clickhouse_config,
+    }
+}
+
+/// Creates a client without setting session-level options like `flatten_nested`.
+/// Use this for connecting to remote/read-only ClickHouse servers (e.g. `init --from-remote`, `db pull`).
+pub fn create_readonly_client(clickhouse_config: ClickHouseConfig) -> ConfiguredDBClient {
+    ConfiguredDBClient {
+        client: create_base_client(&clickhouse_config),
+        config: clickhouse_config,
+    }
+}
+
+fn create_base_client(clickhouse_config: &ClickHouseConfig) -> Client {
     let protocol = if clickhouse_config.use_ssl {
         "https"
     } else {
         "http"
     };
-    ConfiguredDBClient {
-        client: Client::default()
-            .with_url(format!(
-                "{}://{}:{}",
-                protocol, clickhouse_config.host, clickhouse_config.host_port
-            ))
-            .with_user(clickhouse_config.user.to_string())
-            .with_password(clickhouse_config.password.to_string())
-            .with_database(clickhouse_config.db_name.to_string())
-            .with_option("enable_json_type", "1")
-            .with_option("flatten_nested", "0"),
-        config: clickhouse_config,
-    }
+    Client::default()
+        .with_url(format!(
+            "{}://{}:{}",
+            protocol, clickhouse_config.host, clickhouse_config.host_port
+        ))
+        .with_user(clickhouse_config.user.to_string())
+        .with_password(clickhouse_config.password.to_string())
+        .with_database(clickhouse_config.db_name.to_string())
 }
 
 /// Executes a SQL query against the ClickHouse database
@@ -2224,17 +2556,21 @@ impl OlapOperations for ConfiguredDBClient {
                     None
                 };
 
-                let (default, materialized) = match default_kind.deref() {
-                    "" => (None, None),
-                    "DEFAULT" => (Some(default_expression.clone()), None),
-                    "MATERIALIZED" => (None, Some(default_expression.clone())),
-                    "ALIAS" => {
-                        debug!("ALIAS columns not yet handled.");
-                        (None, None)
+                let (default, materialized, alias) = match default_kind.parse() {
+                    Ok(DefaultExpressionKind::Default) => {
+                        (Some(default_expression.clone()), None, None)
                     }
-                    _ => {
-                        debug!("Unknown default kind: {default_kind} for column {col_name}");
-                        (None, None)
+                    Ok(DefaultExpressionKind::Materialized) => {
+                        (None, Some(default_expression.clone()), None)
+                    }
+                    Ok(DefaultExpressionKind::Alias) => {
+                        (None, None, Some(default_expression.clone()))
+                    }
+                    Err(_) => {
+                        if !default_kind.is_empty() {
+                            warn!("Unknown default kind: {default_kind} for column {col_name}");
+                        }
+                        (None, None, None)
                     }
                 };
 
@@ -2292,6 +2628,7 @@ impl OlapOperations for ConfiguredDBClient {
                     ttl: normalized_ttl,
                     codec,
                     materialized,
+                    alias,
                 };
 
                 columns.push(column);
@@ -2476,6 +2813,13 @@ impl OlapOperations for ConfiguredDBClient {
                 table_settings_hash: None,
                 table_settings,
                 indexes,
+                projections: extract_projections_from_create_table(&create_query)
+                    .into_iter()
+                    .map(|p| TableProjection {
+                        name: p.name,
+                        body: p.body,
+                    })
+                    .collect(),
                 database: Some(database),
                 table_ttl_setting,
                 // cluster_name is always None from introspection because ClickHouse doesn't store
@@ -2483,6 +2827,7 @@ impl OlapOperations for ConfiguredDBClient {
                 // in system tables. Users must manually specify cluster in their table configs.
                 cluster_name: None,
                 primary_key_expression: final_primary_key_expression,
+                seed_filter: Default::default(),
             };
             debug!("Created table object: {:?}", table);
 
@@ -2589,6 +2934,113 @@ impl OlapOperations for ConfiguredDBClient {
         Ok(sql_resources)
     }
 
+    /// Retrieves row policies from ClickHouse that are assigned to moose_rls_role.
+    ///
+    /// Queries `system.row_policies` and parses the `select_filter` expression
+    /// to reconstruct `SelectRowPolicy` structs for reality checking.
+    async fn list_row_policies(
+        &self,
+        db_name: &str,
+    ) -> Result<Vec<SelectRowPolicy>, OlapChangesError> {
+        use std::collections::HashMap;
+
+        debug!(
+            "Starting list_row_policies operation for database: {}",
+            db_name
+        );
+
+        // Query row policies that belong to the shared RLS role.
+        // Uses has() instead of = to match policies even if additional roles are present.
+        let query = format!(
+            r#"
+            SELECT
+                short_name,
+                `table`,
+                COALESCE(select_filter, '') AS select_filter
+            FROM system.row_policies
+            WHERE database = ?
+            AND has(apply_to_list, '{MOOSE_RLS_ROLE}')
+            ORDER BY short_name, `table`
+            "#
+        );
+        debug!("Executing row policies query for database: {}", db_name);
+
+        let mut cursor = self
+            .client
+            .query(&query)
+            .bind(db_name)
+            .fetch::<(String, String, String)>()
+            .map_err(|e| {
+                debug!("Error fetching row policies: {}", e);
+                OlapChangesError::DatabaseError(e.to_string())
+            })?;
+
+        // Group by policy name — a single SelectRowPolicy can apply to multiple tables.
+        // The short_name format is "{policy_name}_on_{table}", so we extract the base name.
+        let mut policy_map: HashMap<String, (Vec<TableReference>, String)> = HashMap::new();
+
+        while let Some((short_name, table, select_filter)) = cursor
+            .next()
+            .await
+            .map_err(|e| OlapChangesError::DatabaseError(e.to_string()))?
+        {
+            debug!(
+                "Found row policy: {} on table {} with filter: {}",
+                short_name, table, select_filter
+            );
+
+            // Parse the select_filter to extract the column name.
+            // Expected format: `column` = getSetting('SQL_moose_rls_column')
+            // Note: The JWT claim cannot be recovered from DDL; it is set to the column
+            // name as a placeholder. The reality checker must skip the claim field when
+            // comparing policies.
+            let column = match parse_row_policy_filter(&select_filter) {
+                Some(col) => col,
+                None => {
+                    debug!(
+                        "Skipping row policy '{}': could not parse select_filter '{}'",
+                        short_name, select_filter
+                    );
+                    continue;
+                }
+            };
+
+            // Extract the base policy name from short_name by removing "_on_{table}" suffix
+            let policy_name = if let Some(base) = short_name.strip_suffix(&format!("_on_{}", table))
+            {
+                base.to_string()
+            } else {
+                short_name.clone()
+            };
+
+            let entry = policy_map
+                .entry(policy_name)
+                .or_insert_with(|| (Vec::new(), column.clone()));
+            entry.0.push(TableReference {
+                name: table,
+                database: Some(db_name.to_string()),
+            });
+        }
+
+        let policies: Vec<SelectRowPolicy> = policy_map
+            .into_iter()
+            .map(|(name, (tables, column))| SelectRowPolicy {
+                name,
+                tables,
+                column: column.clone(),
+                // The JWT claim is not stored in ClickHouse DDL; use column as
+                // placeholder. The reality checker skips claim in comparisons.
+                claim: column,
+            })
+            .collect();
+
+        debug!(
+            "Completed list_row_policies operation, found {} policies",
+            policies.len()
+        );
+        Ok(policies)
+    }
+
     /// Normalizes SQL using ClickHouse's native formatQuerySingleLine function.
     ///
     /// This provides accurate SQL normalization that handles:
@@ -2616,6 +3068,27 @@ impl OlapOperations for ConfiguredDBClient {
             }
         }
     }
+}
+
+/// Parse a ClickHouse row policy `select_filter` expression to extract the column name.
+///
+/// Expected format: `` `column` = getSetting('SQL_moose_rls_column') ``
+/// Returns `Some(column)` on success, `None` if the format doesn't match.
+///
+/// Note: The JWT claim name is NOT stored in ClickHouse DDL. The setting name
+/// `SQL_moose_rls_{column}` encodes the column, not the claim. The caller must
+/// resolve the claim from the desired infrastructure map.
+fn parse_row_policy_filter(filter: &str) -> Option<String> {
+    static ROW_POLICY_FILTER_PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
+        // Also handle unquoted column names
+        regex::Regex::new(r"^`?([^`=\s]+)`?\s*=\s*getSetting\('SQL_moose_rls_([^']+)'\)$")
+            .expect("ROW_POLICY_FILTER_PATTERN regex should compile")
+    });
+
+    let captures = ROW_POLICY_FILTER_PATTERN.captures(filter.trim())?;
+    let column = captures.get(1)?.as_str().to_string();
+
+    Some(column)
 }
 
 static MATERIALIZED_VIEW_TO_PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -3069,7 +3542,7 @@ pub fn extract_column_ttls_from_create_query(
 
             // Find the closing parenthesis at depth 0 (the one that ends the column list)
             let mut depth = 0;
-            for (i, ch) in after.chars().enumerate() {
+            for (i, ch) in after.char_indices() {
                 if i >= cut {
                     break;
                 }
@@ -3312,6 +3785,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let after_column = Column {
@@ -3332,6 +3806,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // The execute_modify_table_column function should detect this as comment-only change
@@ -3359,6 +3834,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
         let after_column = Column {
             default: Some("42".to_string()),
@@ -3366,9 +3842,14 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         };
 
         let ch_after = std_column_to_clickhouse_column(after_column).unwrap();
-        let sqls =
-            build_modify_column_sql("db", "table", &ch_after, false, false, false, false, None)
-                .unwrap();
+        let sqls = build_modify_column_sql(
+            "db",
+            "table",
+            &ch_after,
+            &ColumnPropertyRemovals::default(),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(sqls.len(), 1);
         assert_eq!(
@@ -3394,6 +3875,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let after_column = Column {
@@ -3428,6 +3910,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let clickhouse_column = std_column_to_clickhouse_column(column).unwrap();
@@ -3436,10 +3919,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             "test_db",
             "users",
             &clickhouse_column,
-            false,
-            false,
-            false,
-            false,
+            &ColumnPropertyRemovals::default(),
             None,
         )
         .unwrap();
@@ -3468,16 +3948,14 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let sqls = build_modify_column_sql(
             "test_db",
             "test_table",
             &sample_hash_col,
-            false,
-            false,
-            false,
-            false,
+            &ColumnPropertyRemovals::default(),
             None,
         )
         .unwrap();
@@ -3501,16 +3979,14 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let sqls = build_modify_column_sql(
             "test_db",
             "test_table",
             &created_at_col,
-            false,
-            false,
-            false,
-            false,
+            &ColumnPropertyRemovals::default(),
             None,
         )
         .unwrap();
@@ -3534,16 +4010,14 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let sqls = build_modify_column_sql(
             "test_db",
             "test_table",
             &status_col,
-            false,
-            false,
-            false,
-            false,
+            &ColumnPropertyRemovals::default(),
             None,
         )
         .unwrap();
@@ -3970,6 +4444,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let clickhouse_column = std_column_to_clickhouse_column(column).unwrap();
@@ -4033,6 +4508,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let clickhouse_column = std_column_to_clickhouse_column(column).unwrap();
@@ -4099,6 +4575,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
                 ttl: Some("created_at + INTERVAL 7 DAY".to_string()),
                 codec: None,
                 materialized: None,
+                alias: None,
             }],
             order_by: OrderBy::Fields(vec!["id".to_string()]),
             partition_by: Some("toYYYYMM(created_at)".to_string()),
@@ -4115,10 +4592,12 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             table_settings_hash: None,
             table_settings: None,
             indexes: vec![],
+            projections: vec![],
             database: None,
             cluster_name: None,
             table_ttl_setting: Some("created_at + INTERVAL 30 DAY".to_string()),
             primary_key_expression: None,
+            seed_filter: Default::default(),
         };
 
         let ignore_ops = vec![
@@ -4169,6 +4648,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
                 ttl: Some("created_at + INTERVAL 7 DAY".to_string()),
                 codec: None,
                 materialized: None,
+                alias: None,
             }],
             order_by: OrderBy::Fields(vec!["id".to_string()]),
             partition_by: Some("toYYYYMM(created_at)".to_string()),
@@ -4185,10 +4665,12 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             table_settings_hash: None,
             table_settings: None,
             indexes: vec![],
+            projections: vec![],
             database: None,
             cluster_name: None,
             table_ttl_setting: Some("created_at + INTERVAL 30 DAY".to_string()),
             primary_key_expression: None,
+            seed_filter: Default::default(),
         };
 
         let ignore_ops = vec![];
@@ -4207,6 +4689,122 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             normalized.columns[0].ttl, table.columns[0].ttl,
             "Column TTL should remain unchanged"
         );
+    }
+
+    #[test]
+    fn test_normalize_table_for_diff_strips_low_cardinality_annotations() {
+        use crate::framework::core::infrastructure::table::{Column, ColumnType, OrderBy, Table};
+        use crate::framework::core::infrastructure_map::{PrimitiveSignature, PrimitiveTypes};
+        use crate::framework::core::partial_infrastructure_map::LifeCycle;
+
+        let table = Table {
+            name: "test_table".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![("LowCardinality".to_string(), serde_json::json!(true))],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "name".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![
+                        ("LowCardinality".to_string(), serde_json::json!(true)),
+                        ("other".to_string(), serde_json::json!("value")),
+                    ],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "regular_column".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![("other".to_string(), serde_json::json!("value"))],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "Test".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::default_for_deserialization(),
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            cluster_name: None,
+            table_ttl_setting: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        };
+
+        let ignore_ops = vec![IgnorableOperation::IgnoreStringLowCardinalityDifferences];
+        let normalized = super::normalize_table_for_diff(&table, &ignore_ops);
+
+        // Check that LowCardinality annotations were stripped
+        assert_eq!(
+            normalized.columns[0].annotations.len(),
+            0,
+            "Column 'id' should have no annotations after LowCardinality stripping"
+        );
+
+        assert_eq!(
+            normalized.columns[1].annotations.len(),
+            1,
+            "Column 'name' should have only non-LowCardinality annotations"
+        );
+        assert_eq!(
+            normalized.columns[1].annotations[0].0, "other",
+            "Only the 'other' annotation should remain for 'name' column"
+        );
+
+        assert_eq!(
+            normalized.columns[2].annotations.len(),
+            1,
+            "Regular column should keep its non-LowCardinality annotations"
+        );
+        assert_eq!(
+            normalized.columns[2].annotations[0].0, "other",
+            "Regular column should still have its 'other' annotation"
+        );
+
+        // Check that other fields remain unchanged
+        assert_eq!(normalized.name, table.name);
+        assert_eq!(normalized.columns[0].name, "id");
+        assert_eq!(normalized.columns[1].name, "name");
+        assert_eq!(normalized.columns[2].name, "regular_column");
+        assert_eq!(normalized.order_by, table.order_by);
     }
 
     #[test]
@@ -4364,6 +4962,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             unique: false,
             default: None,
             materialized: Some("toStartOfMonth(event_time)".to_string()),
+            alias: None,
             comment: None,
             ttl: None,
             codec: None,
@@ -4373,10 +4972,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             "test_db",
             "test_table",
             &ch_col,
-            false, // removing_default
-            false, // removing_materialized
-            false, // removing_ttl
-            false, // removing_codec
+            &ColumnPropertyRemovals::default(),
             None,
         )
         .unwrap();
@@ -4402,6 +4998,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             unique: false,
             default: None, // No default after removal
             materialized: None,
+            alias: None,
             comment: None,
             ttl: None,
             codec: None,
@@ -4411,10 +5008,10 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             "test_db",
             "test_table",
             &ch_col,
-            true, // removing_default
-            false,
-            false,
-            false,
+            &ColumnPropertyRemovals {
+                default_expression: Some(DefaultExpressionKind::Default),
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -4439,6 +5036,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             unique: false,
             default: None,
             materialized: None,
+            alias: None,
             comment: None,
             ttl: None,
             codec: None,
@@ -4448,10 +5046,10 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             "test_db",
             "test_table",
             &ch_col,
-            false,
-            true, // removing_materialized
-            false,
-            false,
+            &ColumnPropertyRemovals {
+                default_expression: Some(DefaultExpressionKind::Materialized),
+                ..Default::default()
+            },
             None,
         )
         .unwrap();

@@ -54,10 +54,11 @@ use super::{
         topic::{KafkaSchema, Topic, DEFAULT_MAX_MESSAGE_BYTES},
         topic_sync_process::{TopicToTableSyncProcess, TopicToTopicSyncProcess},
         view::Dmv1View,
+        InfrastructureSignature,
     },
     infrastructure_map::{InfrastructureMap, PrimitiveSignature, PrimitiveTypes},
 };
-use crate::framework::core::infrastructure::table::OrderBy;
+use crate::framework::core::infrastructure::table::{OrderBy, SeedFilter, TableProjection};
 use crate::infrastructure::olap::clickhouse::queries::BufferEngine;
 use crate::{
     framework::{
@@ -336,6 +337,8 @@ struct PartialTable {
     pub table_settings: Option<std::collections::HashMap<String, String>>,
     #[serde(default)]
     pub indexes: Vec<TableIndex>,
+    #[serde(default)]
+    pub projections: Vec<TableProjection>,
     /// Optional table-level TTL expression (ClickHouse expression, without leading 'TTL')
     #[serde(alias = "ttl")]
     pub ttl: Option<String>,
@@ -348,6 +351,13 @@ struct PartialTable {
     /// Optional PRIMARY KEY expression (overrides column-level primary_key flags when specified)
     #[serde(default, alias = "primary_key_expression")]
     pub primary_key_expression: Option<String>,
+    /// Per-table filter for `moose seed clickhouse`
+    #[serde(
+        default,
+        alias = "seed_filter",
+        deserialize_with = "crate::framework::core::infrastructure::table::deserialize_nullable_as_default"
+    )]
+    pub seed_filter: SeedFilter,
 }
 
 /// Represents a topic definition from user code before it's converted into a complete [`Topic`].
@@ -396,6 +406,10 @@ struct PartialIngestApi {
     pub version: Option<String>,
     pub metadata: Option<Metadata>,
     #[serde(default)]
+    pub pulls_data_from: Vec<InfrastructureSignature>,
+    #[serde(default)]
+    pub pushes_data_to: Vec<InfrastructureSignature>,
+    #[serde(default)]
     pub dead_letter_queue: Option<String>,
     /// Optional custom path for the ingestion endpoint.
     /// If not specified, defaults to "ingest/{name}/{version}"
@@ -420,6 +434,10 @@ struct PartialApi {
     pub response_schema: serde_json::Value,
     pub version: Option<String>,
     pub metadata: Option<Metadata>,
+    #[serde(default)]
+    pub pulls_data_from: Vec<InfrastructureSignature>,
+    #[serde(default)]
+    pub pushes_data_to: Vec<InfrastructureSignature>,
     /// Optional custom path for the consumption endpoint.
     /// If not specified, defaults to "{name}" or "{name}/{version}"
     #[serde(default)]
@@ -432,6 +450,10 @@ struct PartialWebApp {
     pub name: String,
     pub mount_path: String,
     pub metadata: Option<Metadata>,
+    #[serde(default)]
+    pub pulls_data_from: Vec<InfrastructureSignature>,
+    #[serde(default)]
+    pub pushes_data_to: Vec<InfrastructureSignature>,
 }
 
 /// Specifies a write destination for data ingestion.
@@ -456,6 +478,9 @@ pub struct TransformationTarget {
     /// Source file path where this transform was declared
     #[serde(default)]
     pub source_file: Option<String>,
+    /// Dead letter queue stream name for failed records
+    #[serde(default)]
+    pub dead_letter_queue: Option<String>,
 }
 
 /// Configuration for a topic consumer.
@@ -469,14 +494,24 @@ pub struct Consumer {
     /// Source file path where this consumer was declared
     #[serde(default)]
     pub source_file: Option<String>,
+    /// Dead letter queue stream name for failed records
+    #[serde(default)]
+    pub dead_letter_queue: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartialWorkflow {
     pub name: String,
     pub retries: Option<u32>,
     pub timeout: Option<String>,
     pub schedule: Option<String>,
+    /// Infrastructure components this workflow reads data from (lineage).
+    #[serde(default)]
+    pub pulls_data_from: Vec<InfrastructureSignature>,
+    /// Infrastructure components this workflow writes data to (lineage).
+    #[serde(default)]
+    pub pushes_data_to: Vec<InfrastructureSignature>,
 }
 
 /// Errors that can occur during the loading of Data Model V2 infrastructure definitions.
@@ -563,6 +598,9 @@ pub struct PartialInfrastructureMap {
     >,
     #[serde(default)]
     views: HashMap<String, crate::framework::core::infrastructure::view::View>,
+    #[serde(default)]
+    select_row_policies:
+        HashMap<String, crate::framework::core::infrastructure::select_row_policy::SelectRowPolicy>,
     /// List of source files that exist in the project but were not loaded during the build process.
     /// This is used to warn developers about potentially missing imports or configuration issues.
     /// File paths should be relative to the project root.
@@ -711,6 +749,7 @@ impl PartialInfrastructureMap {
             web_apps,
             materialized_views: self.materialized_views,
             views: self.views,
+            select_row_policies: self.select_row_policies,
             moose_version: None,
         };
 
@@ -808,10 +847,12 @@ impl PartialInfrastructureMap {
                     },
                     table_settings_hash: None, // Will be computed below
                     indexes: partial_table.indexes.clone(),
+                    projections: partial_table.projections.clone(),
                     table_ttl_setting,
                     database: partial_table.database.clone(),
                     cluster_name: partial_table.cluster.clone(),
                     primary_key_expression: partial_table.primary_key_expression.clone(),
+                    seed_filter: partial_table.seed_filter.clone(),
                 };
 
                 // Compute table_settings_hash for change detection, then canonicalize
@@ -1051,6 +1092,16 @@ impl PartialInfrastructureMap {
             .collect()
     }
 
+    /// Builds a name-to-topic index for O(1) lookups.
+    ///
+    /// The `topics` map is keyed by `topic.id()` (which includes a version suffix),
+    /// but callers frequently need to look up topics by their bare `name`. This
+    /// builds the reverse index. Names are unique within a single infra map
+    /// generation because the SDK topics map is keyed by name.
+    fn topic_name_index(topics: &HashMap<String, Topic>) -> HashMap<&str, &Topic> {
+        topics.values().map(|t| (t.name.as_str(), t)).collect()
+    }
+
     /// Converts partial API endpoint definitions into complete [`ApiEndpoint`] instances.
     ///
     /// Handles both ingestion and API endpoints, setting up appropriate paths,
@@ -1066,6 +1117,7 @@ impl PartialInfrastructureMap {
         topics: &HashMap<String, Topic>,
     ) -> HashMap<String, ApiEndpoint> {
         let mut api_endpoints = HashMap::new();
+        let topic_by_name = Self::topic_name_index(topics);
 
         for partial_api in self.ingest_apis.values() {
             let target_topic_name = match &partial_api.write_to.kind {
@@ -1073,9 +1125,8 @@ impl PartialInfrastructureMap {
             };
 
             let not_found = &format!("Target topic '{target_topic_name}' not found");
-            let target_topic = topics
-                .values()
-                .find(|topic| topic.name == target_topic_name)
+            let target_topic = topic_by_name
+                .get(target_topic_name.as_str())
                 .expect(not_found);
 
             // TODO: Remove data model from api endpoints when dmv1 is removed
@@ -1159,6 +1210,8 @@ impl PartialInfrastructureMap {
                     primitive_type: PrimitiveTypes::DataModel,
                 },
                 metadata: partial_api.metadata.clone(),
+                pulls_data_from: partial_api.pulls_data_from.clone(),
+                pushes_data_to: partial_api.pushes_data_to.clone(),
             };
 
             api_endpoints.insert(api_endpoint.id(), api_endpoint);
@@ -1218,6 +1271,8 @@ impl PartialInfrastructureMap {
                     primitive_type: PrimitiveTypes::ConsumptionAPI,
                 },
                 metadata: partial_api.metadata.clone(),
+                pulls_data_from: partial_api.pulls_data_from.clone(),
+                pushes_data_to: partial_api.pushes_data_to.clone(),
             };
 
             api_endpoints.insert(api_endpoint.id(), api_endpoint);
@@ -1242,13 +1297,13 @@ impl PartialInfrastructureMap {
         default_database: &str,
     ) -> HashMap<String, TopicToTableSyncProcess> {
         let mut sync_processes = self.topic_to_table_sync_processes.clone();
+        let topic_by_name = Self::topic_name_index(topics);
 
         for (topic_name, partial_topic) in &self.topics {
             if let Some(target_table_name) = &partial_topic.target_table {
                 let topic_not_found = &format!("Source topic '{topic_name}' not found");
-                let source_topic = topics
-                    .values()
-                    .find(|topic| &topic.name == topic_name)
+                let source_topic = topic_by_name
+                    .get(topic_name.as_str())
                     .expect(topic_not_found);
 
                 let target_table_version: Option<Version> = partial_topic
@@ -1299,6 +1354,7 @@ impl PartialInfrastructureMap {
         topics: &HashMap<String, Topic>,
     ) -> HashMap<String, FunctionProcess> {
         let mut function_processes = self.function_processes.clone();
+        let topic_by_name = Self::topic_name_index(topics);
 
         for (topic_name, source_partial_topic) in &self.topics {
             debug!(
@@ -1307,10 +1363,7 @@ impl PartialInfrastructureMap {
             );
 
             let not_found = &format!("Source topic '{topic_name}' not found");
-            let source_topic = topics
-                .values()
-                .find(|topic| &topic.name == topic_name)
-                .expect(not_found);
+            let source_topic = topic_by_name.get(topic_name.as_str()).expect(not_found);
 
             for transformation_target in &source_partial_topic.transformation_targets {
                 debug!("transformation_target: {:?}", transformation_target);
@@ -1319,9 +1372,8 @@ impl PartialInfrastructureMap {
                 let process_name = format!("{}__{}", topic_name, transformation_target.name);
 
                 let not_found = &format!("Target topic '{}' not found", transformation_target.name);
-                let target_topic = topics
-                    .values()
-                    .find(|topic| topic.name == transformation_target.name)
+                let target_topic = topic_by_name
+                    .get(transformation_target.name.as_str())
                     .expect(not_found);
 
                 // Build metadata with source file if available
@@ -1345,6 +1397,11 @@ impl PartialInfrastructureMap {
                     (None, None) => None,
                 };
 
+                let dead_letter_queue_topic_id = transformation_target
+                    .dead_letter_queue
+                    .as_ref()
+                    .and_then(|dlq_name| topic_by_name.get(dlq_name.as_str()).map(|t| t.id()));
+
                 let function_process = FunctionProcess {
                     name: process_name.clone(),
                     source_topic_id: source_topic.id(),
@@ -1361,6 +1418,7 @@ impl PartialInfrastructureMap {
                         primitive_type: PrimitiveTypes::Function,
                     },
                     metadata,
+                    dead_letter_queue_topic_id,
                 };
 
                 function_processes.insert(function_process.id(), function_process);
@@ -1374,6 +1432,11 @@ impl PartialInfrastructureMap {
                         file: source_file.clone(),
                     }),
                 });
+
+                let dead_letter_queue_topic_id = consumer
+                    .dead_letter_queue
+                    .as_ref()
+                    .and_then(|dlq_name| topic_by_name.get(dlq_name.as_str()).map(|t| t.id()));
 
                 let function_process = FunctionProcess {
                     // In dmv1, consumer process has the id format!("{}_{}_{}", self.name, self.source_topic_id, self.version)
@@ -1389,6 +1452,7 @@ impl PartialInfrastructureMap {
                         primitive_type: PrimitiveTypes::DataModel,
                     },
                     metadata,
+                    dead_letter_queue_topic_id,
                 };
 
                 function_processes.insert(function_process.id(), function_process);
@@ -1417,8 +1481,9 @@ impl PartialInfrastructureMap {
                     partial_workflow.retries,
                     partial_workflow.timeout.clone(),
                     partial_workflow.schedule.clone(),
-                )
-                .expect("Failed to create workflow from user code");
+                    partial_workflow.pulls_data_from.clone(),
+                    partial_workflow.pushes_data_to.clone(),
+                );
                 (partial_workflow.name.clone(), workflow)
             })
             .collect()
@@ -1439,6 +1504,8 @@ impl PartialInfrastructureMap {
                             description: m.description.clone(),
                         }
                     }),
+                    pulls_data_from: partial_webapp.pulls_data_from.clone(),
+                    pushes_data_to: partial_webapp.pushes_data_to.clone(),
                 };
                 (partial_webapp.name.clone(), webapp)
             })
@@ -1469,6 +1536,20 @@ fn normalize_all_metadata_paths(infra_map: &mut InfrastructureMap, project_root:
         if let Some(metadata) = &mut func.metadata {
             metadata.normalize_source_path(project_root);
         }
+        let normalized = normalize_path_string(&func.executable.to_string_lossy(), project_root);
+        func.executable = PathBuf::from(normalized);
+    }
+
+    for mv in infra_map.materialized_views.values_mut() {
+        if let Some(metadata) = &mut mv.metadata {
+            metadata.normalize_source_path(project_root);
+        }
+    }
+
+    for view in infra_map.views.values_mut() {
+        if let Some(metadata) = &mut view.metadata {
+            metadata.normalize_source_path(project_root);
+        }
     }
 
     // SqlResource has source_file directly, not in metadata struct
@@ -1476,5 +1557,246 @@ fn normalize_all_metadata_paths(infra_map: &mut InfrastructureMap, project_root:
         if let Some(source_file) = &mut resource.source_file {
             *source_file = normalize_path_string(source_file, project_root);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::core::infrastructure::topic::Topic;
+    use crate::framework::core::infrastructure::{DataLineage, InfrastructureSignature};
+    use crate::framework::core::infrastructure_map::{PrimitiveSignature, PrimitiveTypes};
+    use crate::framework::languages::SupportedLanguages;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn deserializes_workflow_lineage_from_camel_case_fields() {
+        let payload = json!({
+            "workflows": {
+                "lineageWorkflow": {
+                    "name": "lineageWorkflow",
+                    "pullsDataFrom": [{ "kind": "Table", "id": "Orders" }],
+                    "pushesDataTo": [{ "kind": "Topic", "id": "OrdersEvents" }]
+                }
+            }
+        });
+
+        let partial: PartialInfrastructureMap =
+            serde_json::from_value(payload).expect("payload should deserialize");
+        let workflows = partial.convert_workflows(SupportedLanguages::Typescript);
+        let workflow = workflows
+            .get("lineageWorkflow")
+            .expect("workflow should be converted");
+
+        assert_eq!(
+            workflow.pulls_data_from(),
+            [InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            }]
+        );
+        assert_eq!(
+            workflow.pushes_data_to(),
+            [InfrastructureSignature::Topic {
+                id: "OrdersEvents".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn deserializes_api_lineage_from_camel_case_fields() {
+        let payload = json!({
+            "apis": {
+                "lineageApi": {
+                    "name": "lineageApi",
+                    "queryParams": [],
+                    "responseSchema": {},
+                    "pullsDataFrom": [{ "kind": "Table", "id": "Orders" }],
+                    "pushesDataTo": [{ "kind": "Topic", "id": "OrdersEvents" }]
+                }
+            }
+        });
+
+        let partial: PartialInfrastructureMap =
+            serde_json::from_value(payload).expect("payload should deserialize");
+        let apis = partial.convert_api_endpoints(Path::new("app/index.ts"), &HashMap::new());
+        let api = apis
+            .values()
+            .find(|api| api.name == "lineageApi")
+            .expect("api should be converted");
+
+        assert_eq!(
+            api.pulls_data_from("default"),
+            [InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            }]
+        );
+        assert_eq!(
+            api.pushes_data_to("default"),
+            [InfrastructureSignature::Topic {
+                id: "OrdersEvents".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn deserializes_ingest_api_lineage_from_camel_case_fields() {
+        let payload = json!({
+            "ingestApis": {
+                "lineageIngestApi": {
+                    "name": "lineageIngestApi",
+                    "columns": [],
+                    "writeTo": {
+                        "kind": "stream",
+                        "name": "OrdersStream"
+                    },
+                    "pullsDataFrom": [{ "kind": "Table", "id": "Orders" }],
+                    "pushesDataTo": [{ "kind": "Topic", "id": "OrdersEvents" }]
+                }
+            }
+        });
+
+        let partial: PartialInfrastructureMap =
+            serde_json::from_value(payload).expect("payload should deserialize");
+
+        let mut topics = HashMap::new();
+        topics.insert(
+            "OrdersStream".to_string(),
+            Topic {
+                version: None,
+                name: "OrdersStream".to_string(),
+                retention_period: Duration::from_secs(60),
+                partition_count: 1,
+                max_message_bytes: 1024 * 1024,
+                columns: vec![],
+                source_primitive: PrimitiveSignature {
+                    name: "OrdersStream".to_string(),
+                    primitive_type: PrimitiveTypes::DataModel,
+                },
+                metadata: None,
+                life_cycle: LifeCycle::FullyManaged,
+                schema_config: None,
+            },
+        );
+
+        let apis = partial.convert_api_endpoints(Path::new("app/index.ts"), &topics);
+        let api = apis
+            .values()
+            .find(|api| api.name == "lineageIngestApi")
+            .expect("ingest api should be converted");
+
+        assert_eq!(
+            api.pulls_data_from("default"),
+            [InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            }]
+        );
+        assert_eq!(
+            api.pushes_data_to("default"),
+            [
+                InfrastructureSignature::Topic {
+                    id: "OrdersStream".to_string(),
+                },
+                InfrastructureSignature::Topic {
+                    id: "OrdersEvents".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn deserializes_webapp_lineage_from_camel_case_fields() {
+        let payload = json!({
+            "webApps": {
+                "lineageWebApp": {
+                    "name": "lineageWebApp",
+                    "mountPath": "/lineage",
+                    "pullsDataFrom": [{ "kind": "Table", "id": "Orders" }],
+                    "pushesDataTo": [{ "kind": "Topic", "id": "OrdersEvents" }]
+                }
+            }
+        });
+
+        let partial: PartialInfrastructureMap =
+            serde_json::from_value(payload).expect("payload should deserialize");
+        let web_apps = partial.convert_web_apps();
+        let web_app = web_apps
+            .get("lineageWebApp")
+            .expect("web app should be converted");
+
+        assert_eq!(
+            web_app.pulls_data_from,
+            [InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            }]
+        );
+        assert_eq!(
+            web_app.pushes_data_to,
+            [InfrastructureSignature::Topic {
+                id: "OrdersEvents".to_string(),
+            }]
+        );
+    }
+
+    fn base_table_json() -> serde_json::Value {
+        json!({
+            "name": "t1",
+            "columns": [],
+            "orderBy": ["id"]
+        })
+    }
+
+    fn get_seed_filter(payload: serde_json::Value) -> SeedFilter {
+        let partial: PartialInfrastructureMap =
+            serde_json::from_value(payload).expect("payload should deserialize");
+        partial
+            .tables
+            .get("t1")
+            .expect("table t1 should exist")
+            .seed_filter
+            .clone()
+    }
+
+    #[test]
+    fn seed_filter_missing_key_defaults() {
+        let payload = json!({ "tables": { "t1": base_table_json() } });
+        assert_eq!(get_seed_filter(payload), SeedFilter::default());
+    }
+
+    #[test]
+    fn seed_filter_null_defaults() {
+        let mut t = base_table_json();
+        t.as_object_mut()
+            .unwrap()
+            .insert("seedFilter".into(), serde_json::Value::Null);
+        let payload = json!({ "tables": { "t1": t } });
+        assert_eq!(get_seed_filter(payload), SeedFilter::default());
+    }
+
+    #[test]
+    fn seed_filter_camel_case() {
+        let mut t = base_table_json();
+        t.as_object_mut().unwrap().insert(
+            "seedFilter".into(),
+            json!({ "limit": 10, "where": "id > 0" }),
+        );
+        let payload = json!({ "tables": { "t1": t } });
+        let sf = get_seed_filter(payload);
+        assert_eq!(sf.limit, Some(10));
+        assert_eq!(sf.where_clause.as_deref(), Some("id > 0"));
+    }
+
+    #[test]
+    fn seed_filter_snake_case() {
+        let mut t = base_table_json();
+        t.as_object_mut()
+            .unwrap()
+            .insert("seed_filter".into(), json!({ "limit": 20 }));
+        let payload = json!({ "tables": { "t1": t } });
+        let sf = get_seed_filter(payload);
+        assert_eq!(sf.limit, Some(20));
+        assert_eq!(sf.where_clause, None);
     }
 }

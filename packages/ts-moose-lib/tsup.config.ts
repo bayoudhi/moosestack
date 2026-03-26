@@ -11,6 +11,7 @@ export default defineConfig({
     "src/moose-tspc.ts",
     "src/moose-runner.ts",
     "src/dmv2/index.ts",
+    "src/testing/index.ts",
   ],
   format: ["cjs", "esm"],
   dts: true, // Generate declaration file (.d.ts)

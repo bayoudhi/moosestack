@@ -33,15 +33,18 @@
 //!
 //! This module is essential for maintaining consistency between the defined infrastructure
 //! and the actual deployed components.
-use super::infrastructure::api_endpoint::{APIType, ApiEndpoint};
+use super::infrastructure::api_endpoint::{APIType, ApiEndpoint, Method};
 use super::infrastructure::consumption_webserver::ConsumptionApiWebServer;
 use super::infrastructure::function_process::FunctionProcess;
 use super::infrastructure::orchestration_worker::OrchestrationWorker;
+use super::infrastructure::select_row_policy::SelectRowPolicy;
 use super::infrastructure::sql_resource::SqlResource;
-use super::infrastructure::table::{Column, OrderBy, Table};
+use super::infrastructure::table::{Column, OrderBy, Table, TableReference};
 use super::infrastructure::topic::Topic;
 use super::infrastructure::topic_sync_process::{TopicToTableSyncProcess, TopicToTopicSyncProcess};
 use super::infrastructure::view::{Dmv1View, View};
+use super::infrastructure::web_app::web_apps_equal_ignore_metadata;
+use super::infrastructure::InfrastructureSignature;
 use super::partial_infrastructure_map::LifeCycle;
 use super::partial_infrastructure_map::PartialInfrastructureMap;
 use crate::cli::display::{show_message_wrapper, Message, MessageType};
@@ -53,6 +56,7 @@ use crate::framework::languages::SupportedLanguages;
 use crate::framework::python::datamodel_config::load_main_py;
 use crate::framework::scripts::Workflow;
 use crate::framework::typescript::parser::ensure_typescript_compiled;
+use crate::framework::versions::Version;
 use crate::infrastructure::olap::clickhouse::codec_expressions_are_equivalent;
 use crate::infrastructure::olap::clickhouse::config::DEFAULT_DATABASE_NAME;
 use crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine;
@@ -65,7 +69,7 @@ use crate::utilities::secrets::CREDENTIAL_PLACEHOLDER;
 use anyhow::{Context, Result};
 use protobuf::{EnumOrUnknown, Message as ProtoMessage};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::{fs, mem};
 
@@ -395,6 +399,8 @@ pub enum OlapChange {
     MaterializedView(Change<MaterializedView>),
     /// Change to a structured view (user-defined SELECT views)
     View(Change<View>),
+    /// Change to a row policy
+    SelectRowPolicy(Change<SelectRowPolicy>),
     /// Explicit operation to populate a materialized view with initial data
     PopulateMaterializedView {
         /// Name of the materialized view
@@ -587,6 +593,10 @@ pub struct InfrastructureMap {
     #[serde(default)]
     pub views: HashMap<String, View>,
 
+    /// Collection of row policies indexed by policy name
+    #[serde(default)]
+    pub select_row_policies: HashMap<String, SelectRowPolicy>,
+
     /// Version of Moose CLI that created or last updated this infrastructure map.
     /// Populated automatically during storage operations.
     /// None for maps created by older CLI versions (pre-version-tracking).
@@ -629,6 +639,7 @@ impl InfrastructureMap {
             web_apps: Default::default(),
             materialized_views: Default::default(),
             views: Default::default(),
+            select_row_policies: Default::default(),
             moose_version: None,
         }
     }
@@ -730,6 +741,11 @@ impl InfrastructureMap {
                 self.views
                     .values()
                     .map(|cv| OlapChange::View(Change::Added(Box::new(cv.clone())))),
+            )
+            .chain(
+                self.select_row_policies.values().map(|policy| {
+                    OlapChange::SelectRowPolicy(Change::Added(Box::new(policy.clone())))
+                }),
             )
             .collect()
     }
@@ -902,6 +918,17 @@ impl InfrastructureMap {
         );
         let view_changes = changes.olap_changes.len() - olap_changes_len_before;
         tracing::info!("View changes detected: {}", view_changes);
+
+        // Row Policies
+        tracing::info!("Analyzing changes in Row Policies...");
+        let olap_changes_len_before = changes.olap_changes.len();
+        Self::diff_select_row_policies(
+            &self.select_row_policies,
+            &target_map.select_row_policies,
+            &mut changes.olap_changes,
+        );
+        let row_policy_changes = changes.olap_changes.len() - olap_changes_len_before;
+        tracing::info!("Row policy changes detected: {}", row_policy_changes);
 
         // All process types
         self.diff_all_processes(target_map, &mut changes.processes_changes);
@@ -1108,7 +1135,7 @@ impl InfrastructureMap {
 
         for (id, webapp) in self_web_apps {
             if let Some(target_webapp) = target_web_apps.get(id) {
-                if webapp != target_webapp {
+                if !web_apps_equal_ignore_metadata(webapp, target_webapp) {
                     tracing::debug!("WebApp updated: {}", id);
                     webapp_updates += 1;
                     web_app_changes.push(WebAppChange::WebApp(Change::Updated {
@@ -1249,7 +1276,7 @@ impl InfrastructureMap {
     ///
     /// This method identifies added, removed, and updated workflows by comparing
     /// the source and target workflow maps. A workflow is considered updated when
-    /// its configuration (schedule, retries, timeout) has changed.
+    /// its configuration (schedule, retries, timeout) or lineage has changed.
     ///
     /// # Arguments
     /// * `self_workflows` - HashMap of source workflows to compare from
@@ -1898,6 +1925,43 @@ impl InfrastructureMap {
         );
     }
 
+    /// Compare row policies between two infrastructure maps and compute differences.
+    pub fn diff_select_row_policies(
+        self_policies: &HashMap<String, SelectRowPolicy>,
+        target_policies: &HashMap<String, SelectRowPolicy>,
+        olap_changes: &mut Vec<OlapChange>,
+    ) {
+        for (id, policy) in self_policies {
+            if let Some(target_policy) = target_policies.get(id) {
+                let mut a = policy.clone();
+                let mut b = target_policy.clone();
+                a.tables.sort();
+                b.tables.sort();
+                if a != b {
+                    tracing::debug!("Row policy '{}' has differences", id);
+                    olap_changes.push(OlapChange::SelectRowPolicy(Change::Updated {
+                        before: Box::new(policy.clone()),
+                        after: Box::new(target_policy.clone()),
+                    }));
+                }
+            } else {
+                tracing::debug!("Row policy '{}' removed", id);
+                olap_changes.push(OlapChange::SelectRowPolicy(Change::Removed(Box::new(
+                    policy.clone(),
+                ))));
+            }
+        }
+
+        for (id, policy) in target_policies {
+            if !self_policies.contains_key(id) {
+                tracing::debug!("Row policy '{}' added", id);
+                olap_changes.push(OlapChange::SelectRowPolicy(Change::Added(Box::new(
+                    policy.clone(),
+                ))));
+            }
+        }
+    }
+
     /// Compare tables between two infrastructure maps and compute the differences
     ///
     /// This method identifies added, removed, and updated tables by comparing
@@ -1997,7 +2061,8 @@ impl InfrastructureMap {
                             table.name
                         );
                         // Record the blocked update in filtered_changes for user visibility
-                        let column_changes = compute_table_columns_diff(table, target_table);
+                        let column_changes =
+                            compute_table_columns_diff(table, target_table, ignore_ops);
                         let order_by_change = OrderByChange {
                             before: table.order_by.clone(),
                             after: target_table.order_by.clone(),
@@ -2022,7 +2087,8 @@ impl InfrastructureMap {
                         });
                     } else {
                         // Compute the basic diff components
-                        let column_changes = compute_table_columns_diff(table, target_table);
+                        let column_changes =
+                            compute_table_columns_diff(table, target_table, ignore_ops);
 
                         // Compute PARTITION BY changes from normalized tables to respect ignore_ops
                         // Using normalized tables ensures that ignored operations don't incorrectly
@@ -2058,6 +2124,9 @@ impl InfrastructureMap {
                         // Detect index changes (secondary/data-skipping indexes)
                         let indexes_changed = table.indexes != target_table.indexes;
 
+                        // Detect projection changes
+                        let projections_changed = table.projections != target_table.projections;
+
                         // Detect and emit table-level TTL changes
                         // Use normalized comparison to avoid false positives from ClickHouse's TTL normalization
                         if !ttl_expressions_are_equivalent(
@@ -2092,6 +2161,7 @@ impl InfrastructureMap {
                             || partition_by_changed
                             || engine_changed
                             || indexes_changed
+                            || projections_changed
                             || table_settings_changed
                         {
                             // Use the strategy to determine the appropriate changes
@@ -2262,7 +2332,7 @@ impl InfrastructureMap {
             return None;
         }
 
-        let column_changes = compute_table_columns_diff(table, target_table);
+        let column_changes = compute_table_columns_diff(table, target_table, &[]);
         let order_by_changed = !table.order_by_equals(target_table);
 
         let order_by_change = if order_by_changed {
@@ -2332,7 +2402,7 @@ impl InfrastructureMap {
             return None;
         }
 
-        let mut column_changes = compute_table_columns_diff(table, target_table);
+        let mut column_changes = compute_table_columns_diff(table, target_table, &[]);
 
         // For DeletionProtected tables, filter out destructive column changes
         if target_table.life_cycle == LifeCycle::DeletionProtected {
@@ -2719,6 +2789,30 @@ impl InfrastructureMap {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.to_proto()))
                 .collect(),
+            select_row_policies: self
+                .select_row_policies
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        crate::proto::infrastructure_map::SelectRowPolicy {
+                            name: v.name.clone(),
+                            tables: v
+                                .tables
+                                .iter()
+                                .map(|t| crate::proto::infrastructure_map::TableReference {
+                                    database: t.database.clone(),
+                                    table: t.name.clone(),
+                                    special_fields: Default::default(),
+                                })
+                                .collect(),
+                            column: v.column.clone(),
+                            claim: v.claim.clone(),
+                            special_fields: Default::default(),
+                        },
+                    )
+                })
+                .collect(),
             moose_version: self.moose_version.clone().unwrap_or_default(),
             special_fields: Default::default(),
         }
@@ -2869,6 +2963,28 @@ impl InfrastructureMap {
                 .collect(),
             materialized_views,
             views,
+            select_row_policies: proto
+                .select_row_policies
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        SelectRowPolicy {
+                            name: v.name,
+                            tables: v
+                                .tables
+                                .into_iter()
+                                .map(|t| TableReference {
+                                    name: t.table,
+                                    database: t.database,
+                                })
+                                .collect(),
+                            column: v.column,
+                            claim: v.claim,
+                        },
+                    )
+                })
+                .collect(),
             moose_version: if proto.moose_version.is_empty() {
                 None // Backward compat: empty string = not set
             } else {
@@ -3485,22 +3601,48 @@ fn ttl_expressions_are_equivalent(before: &Option<String>, after: &Option<String
 ///
 /// # Returns
 /// `true` if the columns are semantically equivalent, `false` otherwise
-fn columns_are_equivalent(before: &Column, after: &Column) -> bool {
-    // Check all non-data_type and non-ttl and non-codec fields first
-    if before.name != after.name
-        || before.required != after.required
-        || before.unique != after.unique
+fn columns_are_equivalent(
+    before: &Column,
+    after: &Column,
+    ignore_ops: &[crate::infrastructure::olap::clickhouse::IgnorableOperation],
+) -> bool {
+    use crate::infrastructure::olap::clickhouse::{
+        diff_strategy::{column_types_are_equivalent, normalize_column_for_low_cardinality_ignore},
+        IgnorableOperation,
+    };
+
+    // Check if we should ignore LowCardinality differences
+    let ignore_low_cardinality =
+        ignore_ops.contains(&IgnorableOperation::IgnoreStringLowCardinalityDifferences);
+
+    // Normalize columns if ignore flag is set
+    let mut normalized_before =
+        normalize_column_for_low_cardinality_ignore(before, ignore_low_cardinality);
+    let mut normalized_after =
+        normalize_column_for_low_cardinality_ignore(after, ignore_low_cardinality);
+
+    // If ModifyColumnTtl is ignored, treat both TTL values as equal by nulling them out
+    if ignore_ops.contains(&IgnorableOperation::ModifyColumnTtl) {
+        normalized_before.ttl = None;
+        normalized_after.ttl = None;
+    }
+
+    // Check all non-data_type and non-ttl fields first
+    if normalized_before.name != normalized_after.name
+        || normalized_before.required != normalized_after.required
+        || normalized_before.unique != normalized_after.unique
         // primary_key change is handled at the table level
-        || before.default != after.default
-        || before.materialized != after.materialized
-        || before.annotations != after.annotations
-        || before.comment != after.comment
+        || normalized_before.default != normalized_after.default
+        || normalized_before.materialized != normalized_after.materialized
+        || normalized_before.alias != normalized_after.alias
+        || normalized_before.annotations != normalized_after.annotations
+        || normalized_before.comment != normalized_after.comment
     {
         return false;
     }
 
     // Special handling for TTL comparison: normalize both expressions before comparing
-    if !ttl_expressions_are_equivalent(&before.ttl, &after.ttl) {
+    if !ttl_expressions_are_equivalent(&normalized_before.ttl, &normalized_after.ttl) {
         return false;
     }
 
@@ -3512,8 +3654,11 @@ fn columns_are_equivalent(before: &Column, after: &Column) -> bool {
 
     // Use ClickHouse-specific semantic comparison for data types
     // This handles special cases like enums and JSON types with order-independent typed_paths
-    use crate::infrastructure::olap::clickhouse::diff_strategy::column_types_are_equivalent;
-    column_types_are_equivalent(&before.data_type, &after.data_type)
+    column_types_are_equivalent(
+        &normalized_before.data_type,
+        &normalized_after.data_type,
+        ignore_low_cardinality,
+    )
 }
 
 /// Check if two topics are equal, ignoring metadata
@@ -3549,6 +3694,8 @@ fn tables_equal_ignore_metadata(a: &Table, b: &Table) -> bool {
     let mut b = b.clone();
     a.metadata = None;
     b.metadata = None;
+    a.seed_filter = Default::default();
+    b.seed_filter = Default::default();
     a == b
 }
 
@@ -3562,18 +3709,63 @@ fn tables_equal_ignore_metadata(a: &Table, b: &Table) -> bool {
 ///
 /// # Returns
 /// `true` if the API endpoints are equal ignoring metadata, `false` otherwise
+#[derive(PartialEq)]
+struct ApiEndpointComparableForDiff<'a> {
+    name: &'a str,
+    api_type: &'a APIType,
+    path: &'a Path,
+    method: &'a Method,
+    version: Option<&'a Version>,
+    source_primitive: &'a PrimitiveSignature,
+    pulls_data_from: HashSet<&'a InfrastructureSignature>,
+    pushes_data_to: HashSet<&'a InfrastructureSignature>,
+}
+
+impl<'a> From<&'a ApiEndpoint> for ApiEndpointComparableForDiff<'a> {
+    fn from(api_endpoint: &'a ApiEndpoint) -> Self {
+        Self {
+            name: api_endpoint.name.as_str(),
+            api_type: &api_endpoint.api_type,
+            path: api_endpoint.path.as_path(),
+            method: &api_endpoint.method,
+            version: api_endpoint.version.as_ref(),
+            source_primitive: &api_endpoint.source_primitive,
+            pulls_data_from: api_endpoint.pulls_data_from.iter().collect(),
+            pushes_data_to: api_endpoint.pushes_data_to.iter().collect(),
+        }
+    }
+}
+
 fn api_endpoints_equal_ignore_metadata(a: &ApiEndpoint, b: &ApiEndpoint) -> bool {
-    let mut a = a.clone();
-    let mut b = b.clone();
-    a.metadata = None;
-    b.metadata = None;
-    a == b
+    ApiEndpointComparableForDiff::from(a) == ApiEndpointComparableForDiff::from(b)
+}
+
+#[derive(PartialEq)]
+struct WorkflowConfigComparableForDiff<'a> {
+    schedule: &'a str,
+    retries: u32,
+    timeout: &'a str,
+    pulls_data_from: HashSet<&'a InfrastructureSignature>,
+    pushes_data_to: HashSet<&'a InfrastructureSignature>,
+}
+
+impl<'a> From<&'a Workflow> for WorkflowConfigComparableForDiff<'a> {
+    fn from(workflow: &'a Workflow) -> Self {
+        Self {
+            schedule: workflow.config().schedule.as_str(),
+            retries: workflow.config().retries,
+            timeout: workflow.config().timeout.as_str(),
+            pulls_data_from: workflow.pulls_data_from().iter().collect(),
+            pushes_data_to: workflow.pushes_data_to().iter().collect(),
+        }
+    }
 }
 
 /// Check if two workflow configurations are equal
 ///
-/// Compares the schedule, retries, and timeout settings between two workflows.
-/// These are the configuration values that affect how Temporal runs the workflow.
+/// Compares the schedule, retries, timeout, and lineage settings between two workflows.
+/// These are the values that affect how Temporal runs the workflow and how
+/// downstream lineage should be represented.
 ///
 /// # Arguments
 /// * `a` - The first workflow to compare
@@ -3582,9 +3774,7 @@ fn api_endpoints_equal_ignore_metadata(a: &ApiEndpoint, b: &ApiEndpoint) -> bool
 /// # Returns
 /// `true` if the configurations are equal, `false` otherwise
 fn workflows_config_equal(a: &Workflow, b: &Workflow) -> bool {
-    a.config().schedule == b.config().schedule
-        && a.config().retries == b.config().retries
-        && a.config().timeout == b.config().timeout
+    WorkflowConfigComparableForDiff::from(a) == WorkflowConfigComparableForDiff::from(b)
 }
 
 /// Computes the detailed differences between two table versions
@@ -3596,10 +3786,16 @@ fn workflows_config_equal(a: &Workflow, b: &Workflow) -> bool {
 /// # Arguments
 /// * `before` - The original table
 /// * `after` - The modified table
+/// * `ignore_ops` - Operations to ignore during comparison (e.g., `IgnoreStringLowCardinalityDifferences`).
+///   Pass an empty slice to detect all differences.
 ///
 /// # Returns
 /// A vector of `ColumnChange` objects describing the differences
-pub fn compute_table_columns_diff(before: &Table, after: &Table) -> Vec<ColumnChange> {
+pub fn compute_table_columns_diff(
+    before: &Table,
+    after: &Table,
+    ignore_ops: &[crate::infrastructure::olap::clickhouse::IgnorableOperation],
+) -> Vec<ColumnChange> {
     let mut diff = Vec::new();
 
     // Create a HashMap of the 'before' columns: O(n)
@@ -3613,7 +3809,7 @@ pub fn compute_table_columns_diff(before: &Table, after: &Table) -> Vec<ColumnCh
     // Process additions and updates: O(n)
     for (i, after_col) in after.columns.iter().enumerate() {
         if let Some(&before_col) = before_columns.get(&after_col.name) {
-            if !columns_are_equivalent(before_col, after_col) {
+            if !columns_are_equivalent(before_col, after_col, ignore_ops) {
                 tracing::debug!(
                     "Column '{}' modified from {:?} to {:?}",
                     after_col.name,
@@ -3676,6 +3872,7 @@ impl Default for InfrastructureMap {
             web_apps: HashMap::new(),
             materialized_views: HashMap::new(),
             views: HashMap::new(),
+            select_row_policies: HashMap::new(),
             moose_version: None, // Not set until storage
         }
     }
@@ -3711,6 +3908,7 @@ impl serde::Serialize for InfrastructureMap {
             materialized_views:
                 &'a HashMap<String, super::infrastructure::materialized_view::MaterializedView>,
             views: &'a HashMap<String, super::infrastructure::view::View>,
+            select_row_policies: &'a HashMap<String, SelectRowPolicy>,
             #[serde(skip_serializing_if = "Option::is_none")]
             moose_version: &'a Option<String>,
         }
@@ -3735,6 +3933,7 @@ impl serde::Serialize for InfrastructureMap {
             web_apps: &masked_inframap.web_apps,
             materialized_views: &masked_inframap.materialized_views,
             views: &masked_inframap.views,
+            select_row_policies: &masked_inframap.select_row_policies,
             moose_version: &masked_inframap.moose_version,
         };
 
@@ -3781,6 +3980,7 @@ mod tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 },
                 Column {
                     name: "name".to_string(),
@@ -3794,6 +3994,7 @@ mod tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 },
                 Column {
                     name: "to_be_removed".to_string(),
@@ -3807,6 +4008,7 @@ mod tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 },
             ],
             order_by: OrderBy::Fields(vec!["id".to_string()]),
@@ -3823,10 +4025,12 @@ mod tests {
             table_settings_hash: None,
             table_settings: None,
             indexes: vec![],
+            projections: vec![],
             database: None,
             table_ttl_setting: None,
             cluster_name: None,
             primary_key_expression: None,
+            seed_filter: Default::default(),
         };
 
         let after = Table {
@@ -3845,6 +4049,7 @@ mod tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 },
                 Column {
                     name: "name".to_string(),
@@ -3858,6 +4063,7 @@ mod tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 },
                 Column {
                     name: "age".to_string(), // New column
@@ -3871,6 +4077,7 @@ mod tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 },
             ],
             order_by: OrderBy::Fields(vec!["id".to_string(), "name".to_string()]), // Changed order_by
@@ -3887,13 +4094,15 @@ mod tests {
             table_settings_hash: None,
             table_settings: None,
             indexes: vec![],
+            projections: vec![],
             database: None,
             table_ttl_setting: None,
             cluster_name: None,
             primary_key_expression: None,
+            seed_filter: Default::default(),
         };
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
 
         assert_eq!(diff.len(), 3);
         assert!(
@@ -3923,6 +4132,7 @@ mod tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "to_remove".to_string(),
@@ -3936,6 +4146,7 @@ mod tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
         ];
 
@@ -3954,6 +4165,7 @@ mod tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "new_column".to_string(),
@@ -3967,6 +4179,7 @@ mod tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
         ];
 
@@ -4088,6 +4301,7 @@ mod tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         }];
 
         let mut after_table = before_table.clone();
@@ -4104,6 +4318,7 @@ mod tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         map1.tables
@@ -4164,6 +4379,7 @@ mod tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         }];
 
         let mut after_table = before_table.clone();
@@ -4215,6 +4431,7 @@ mod tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         }];
 
         let mut after_table = before_table.clone();
@@ -4275,6 +4492,7 @@ mod tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         }];
 
         let mut after_table = before_table.clone();
@@ -4338,6 +4556,7 @@ mod tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         }];
 
         let mut after_table = before_table.clone();
@@ -4397,10 +4616,12 @@ mod diff_tests {
             table_settings_hash: None,
             table_settings: None,
             indexes: vec![],
+            projections: vec![],
             database: None,
             table_ttl_setting: None,
             cluster_name: None,
             primary_key_expression: None,
+            seed_filter: Default::default(),
         }
     }
 
@@ -4409,7 +4630,7 @@ mod diff_tests {
         let table1 = create_test_table("test", "1.0");
         let table2 = create_test_table("test", "1.0");
 
-        let diff = compute_table_columns_diff(&table1, &table2);
+        let diff = compute_table_columns_diff(&table1, &table2, &[]);
         assert!(diff.is_empty(), "Expected no changes between empty tables");
     }
 
@@ -4430,9 +4651,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 1, "Expected one change");
         match &diff[0] {
             ColumnChange::Added {
@@ -4463,9 +4685,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 1, "Expected one change");
         match &diff[0] {
             ColumnChange::Removed(col) => {
@@ -4493,6 +4716,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         after.columns.push(Column {
@@ -4507,9 +4731,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 1, "Expected one change");
         match &diff[0] {
             ColumnChange::Updated {
@@ -4543,6 +4768,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "to_remove".to_string(),
@@ -4556,6 +4782,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "to_modify".to_string(),
@@ -4569,6 +4796,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
         ]);
 
@@ -4586,6 +4814,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "to_modify".to_string(), // modified
@@ -4599,6 +4828,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "new_column".to_string(), // added
@@ -4612,10 +4842,11 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
         ]);
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 3, "Expected three changes");
 
         // Count each type of change
@@ -4758,6 +4989,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         after.columns.push(Column {
@@ -4772,9 +5004,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 1, "Expected one change");
         match &diff[0] {
             ColumnChange::Updated {
@@ -4807,6 +5040,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         // Same column without DEFAULT value
@@ -4822,9 +5056,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 1, "Expected one change for DEFAULT removal");
         match &diff[0] {
             ColumnChange::Updated {
@@ -4861,6 +5096,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "name".to_string(),
@@ -4874,6 +5110,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
         ]);
 
@@ -4891,6 +5128,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
             Column {
                 name: "id".to_string(),
@@ -4904,10 +5142,11 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             },
         ]);
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert!(
             diff.is_empty(),
             "Expected no changes despite reordered columns"
@@ -4933,6 +5172,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             };
             before.columns.push(col.clone());
             after.columns.push(col);
@@ -4943,7 +5183,7 @@ mod diff_tests {
             col.data_type = ColumnType::BigInt;
         }
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 1, "Expected one change in large table");
     }
 
@@ -4976,6 +5216,7 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             });
 
             // Change every other column type in the after table
@@ -5011,10 +5252,11 @@ mod diff_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             });
         }
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
 
         assert_eq!(
             diff.len(),
@@ -5043,6 +5285,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         after.columns.push(Column {
@@ -5060,9 +5303,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(
             diff.len(),
             1,
@@ -5102,6 +5346,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         after.columns.push(Column {
@@ -5116,6 +5361,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         // Test special characters in column name
@@ -5131,6 +5377,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         after.columns.push(Column {
@@ -5145,9 +5392,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
-        let diff = compute_table_columns_diff(&before, &after);
+        let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(diff.len(), 2, "Expected changes for edge case columns");
     }
 
@@ -5171,19 +5419,20 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
         let col2 = col1.clone();
-        assert!(columns_are_equivalent(&col1, &col2));
+        assert!(columns_are_equivalent(&col1, &col2, &[]));
 
         // Test 2: Different names should not be equivalent
         let mut col3 = col1.clone();
         col3.name = "different".to_string();
-        assert!(!columns_are_equivalent(&col1, &col3));
+        assert!(!columns_are_equivalent(&col1, &col3, &[]));
 
         // Test 2b: Different comments should not be equivalent
         let mut col_with_comment = col1.clone();
         col_with_comment.comment = Some("User documentation".to_string());
-        assert!(!columns_are_equivalent(&col1, &col_with_comment));
+        assert!(!columns_are_equivalent(&col1, &col_with_comment, &[]));
 
         // Test 3: String enum from TypeScript vs integer enum from ClickHouse
         let typescript_enum_col = Column {
@@ -5210,6 +5459,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let clickhouse_enum_col = Column {
@@ -5236,12 +5486,14 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // These should be equivalent due to the enum semantic comparison
         assert!(columns_are_equivalent(
             &clickhouse_enum_col,
-            &typescript_enum_col
+            &typescript_enum_col,
+            &[]
         ));
 
         // Test 4: Different enum values should not be equivalent
@@ -5263,11 +5515,13 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         assert!(!columns_are_equivalent(
             &typescript_enum_col,
-            &different_enum_col
+            &different_enum_col,
+            &[]
         ));
 
         // Test 5: Non-enum types should use standard equality
@@ -5283,6 +5537,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let int_col2 = Column {
@@ -5297,9 +5552,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
-        assert!(!columns_are_equivalent(&int_col1, &int_col2));
+        assert!(!columns_are_equivalent(&int_col1, &int_col2, &[]));
     }
 
     #[test]
@@ -5330,6 +5586,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let json_col2 = Column {
@@ -5354,10 +5611,11 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // These should be equivalent - order of typed_paths doesn't matter
-        assert!(columns_are_equivalent(&json_col1, &json_col2));
+        assert!(columns_are_equivalent(&json_col1, &json_col2, &[]));
 
         // Test: Different typed_paths should not be equivalent
         let json_col3 = Column {
@@ -5381,9 +5639,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
-        assert!(!columns_are_equivalent(&json_col1, &json_col3));
+        assert!(!columns_are_equivalent(&json_col1, &json_col3, &[]));
 
         // Test: Different max_dynamic_paths should not be equivalent
         let json_col4 = Column {
@@ -5408,9 +5667,10 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
-        assert!(!columns_are_equivalent(&json_col1, &json_col4));
+        assert!(!columns_are_equivalent(&json_col1, &json_col4, &[]));
     }
 
     #[test]
@@ -5452,6 +5712,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let nested_json_col2 = Column {
@@ -5487,10 +5748,15 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // These should be equivalent - order doesn't matter at any level
-        assert!(columns_are_equivalent(&nested_json_col1, &nested_json_col2));
+        assert!(columns_are_equivalent(
+            &nested_json_col1,
+            &nested_json_col2,
+            &[]
+        ));
     }
 
     #[test]
@@ -5520,6 +5786,7 @@ mod diff_tests {
                         ttl: None,
                         codec: None,
                         materialized: None,
+                        alias: None,
                     },
                     Column {
                         name: "priority".to_string(),
@@ -5533,6 +5800,7 @@ mod diff_tests {
                         ttl: None,
                         codec: None,
                         materialized: None,
+                        alias: None,
                     },
                 ],
                 jwt: false,
@@ -5546,6 +5814,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let col_with_user_name = Column {
@@ -5568,6 +5837,7 @@ mod diff_tests {
                         ttl: None,
                         codec: None,
                         materialized: None,
+                        alias: None,
                     },
                     Column {
                         name: "priority".to_string(),
@@ -5581,6 +5851,7 @@ mod diff_tests {
                         ttl: None,
                         codec: None,
                         materialized: None,
+                        alias: None,
                     },
                 ],
                 jwt: false,
@@ -5594,12 +5865,14 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // These should be equivalent - name difference doesn't matter if structure matches
         assert!(columns_are_equivalent(
             &col_with_generated_name,
-            &col_with_user_name
+            &col_with_user_name,
+            &[]
         ));
 
         // Test: Different column structures should not be equivalent
@@ -5622,6 +5895,7 @@ mod diff_tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 }], // Missing priority column
                 jwt: false,
             }),
@@ -5634,11 +5908,13 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         assert!(!columns_are_equivalent(
             &col_with_user_name,
-            &col_different_structure
+            &col_different_structure,
+            &[]
         ));
     }
 
@@ -5672,6 +5948,7 @@ mod diff_tests {
                                         ttl: None,
                                         codec: None,
                                         materialized: None,
+                                        alias: None,
                                     },
                                     Column {
                                         name: "notifications".to_string(),
@@ -5685,6 +5962,7 @@ mod diff_tests {
                                         ttl: None,
                                         codec: None,
                                         materialized: None,
+                                        alias: None,
                                     },
                                 ],
                                 jwt: false,
@@ -5698,6 +5976,7 @@ mod diff_tests {
                             ttl: None,
                             codec: None,
                             materialized: None,
+                            alias: None,
                         }],
                         jwt: false,
                     }),
@@ -5710,6 +5989,7 @@ mod diff_tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 }],
                 jwt: false,
             }),
@@ -5722,6 +6002,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         let col_user = Column {
@@ -5749,6 +6030,7 @@ mod diff_tests {
                                         ttl: None,
                                         codec: None,
                                         materialized: None,
+                                        alias: None,
                                     },
                                     Column {
                                         name: "notifications".to_string(),
@@ -5762,6 +6044,7 @@ mod diff_tests {
                                         ttl: None,
                                         codec: None,
                                         materialized: None,
+                                        alias: None,
                                     },
                                 ],
                                 jwt: false,
@@ -5775,6 +6058,7 @@ mod diff_tests {
                             ttl: None,
                             codec: None,
                             materialized: None,
+                            alias: None,
                         }],
                         jwt: false,
                     }),
@@ -5787,6 +6071,7 @@ mod diff_tests {
                     ttl: None,
                     codec: None,
                     materialized: None,
+                    alias: None,
                 }],
                 jwt: false,
             }),
@@ -5799,10 +6084,11 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // These should be equivalent - name differences at all levels don't matter
-        assert!(columns_are_equivalent(&col_generated, &col_user));
+        assert!(columns_are_equivalent(&col_generated, &col_user, &[]));
     }
 
     #[test]
@@ -5821,6 +6107,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // Test 1: Columns with same codec should be equivalent
@@ -5832,7 +6119,11 @@ mod diff_tests {
             codec: Some("ZSTD(3)".to_string()),
             ..base_col.clone()
         };
-        assert!(columns_are_equivalent(&col_with_codec1, &col_with_codec2));
+        assert!(columns_are_equivalent(
+            &col_with_codec1,
+            &col_with_codec2,
+            &[]
+        ));
 
         // Test 2: Columns with different codecs should not be equivalent
         let col_with_different_codec = Column {
@@ -5841,11 +6132,12 @@ mod diff_tests {
         };
         assert!(!columns_are_equivalent(
             &col_with_codec1,
-            &col_with_different_codec
+            &col_with_different_codec,
+            &[]
         ));
 
         // Test 3: Column with codec vs column without codec should not be equivalent
-        assert!(!columns_are_equivalent(&col_with_codec1, &base_col));
+        assert!(!columns_are_equivalent(&col_with_codec1, &base_col, &[]));
 
         // Test 4: Columns with codec chains should be detected as different
         let col_with_chain1 = Column {
@@ -5856,7 +6148,11 @@ mod diff_tests {
             codec: Some("Delta, ZSTD".to_string()),
             ..base_col.clone()
         };
-        assert!(!columns_are_equivalent(&col_with_chain1, &col_with_chain2));
+        assert!(!columns_are_equivalent(
+            &col_with_chain1,
+            &col_with_chain2,
+            &[]
+        ));
 
         // Test 5: Codec with different compression levels should be detected as different
         let col_zstd3 = Column {
@@ -5867,7 +6163,7 @@ mod diff_tests {
             codec: Some("ZSTD(9)".to_string()),
             ..base_col.clone()
         };
-        assert!(!columns_are_equivalent(&col_zstd3, &col_zstd9));
+        assert!(!columns_are_equivalent(&col_zstd3, &col_zstd9, &[]));
 
         // Test 6: Normalized codec comparison - user "Delta" vs ClickHouse "Delta(4)"
         let col_user_delta = Column {
@@ -5878,7 +6174,7 @@ mod diff_tests {
             codec: Some("Delta(4)".to_string()),
             ..base_col.clone()
         };
-        assert!(columns_are_equivalent(&col_user_delta, &col_ch_delta));
+        assert!(columns_are_equivalent(&col_user_delta, &col_ch_delta, &[]));
 
         // Test 7: Normalized codec comparison - user "Gorilla" vs ClickHouse "Gorilla(8)"
         let col_user_gorilla = Column {
@@ -5889,7 +6185,11 @@ mod diff_tests {
             codec: Some("Gorilla(8)".to_string()),
             ..base_col.clone()
         };
-        assert!(columns_are_equivalent(&col_user_gorilla, &col_ch_gorilla));
+        assert!(columns_are_equivalent(
+            &col_user_gorilla,
+            &col_ch_gorilla,
+            &[]
+        ));
 
         // Test 8: Normalized chain comparison - "Delta, LZ4" vs "Delta(4), LZ4"
         let col_user_chain = Column {
@@ -5900,7 +6200,7 @@ mod diff_tests {
             codec: Some("Delta(4), LZ4".to_string()),
             ..base_col.clone()
         };
-        assert!(columns_are_equivalent(&col_user_chain, &col_ch_chain));
+        assert!(columns_are_equivalent(&col_user_chain, &col_ch_chain, &[]));
     }
 
     #[test]
@@ -5919,6 +6219,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         };
 
         // Test 1: Columns with same materialized expression should be equivalent
@@ -5930,7 +6231,7 @@ mod diff_tests {
             materialized: Some("toDate(timestamp)".to_string()),
             ..base_col.clone()
         };
-        assert!(columns_are_equivalent(&col_with_mat1, &col_with_mat2));
+        assert!(columns_are_equivalent(&col_with_mat1, &col_with_mat2, &[]));
 
         // Test 2: Columns with different materialized expressions should not be equivalent
         let col_with_different_mat = Column {
@@ -5939,26 +6240,28 @@ mod diff_tests {
         };
         assert!(!columns_are_equivalent(
             &col_with_mat1,
-            &col_with_different_mat
+            &col_with_different_mat,
+            &[]
         ));
 
         // Test 3: Column with materialized vs column without materialized should not be equivalent
-        assert!(!columns_are_equivalent(&col_with_mat1, &base_col));
+        assert!(!columns_are_equivalent(&col_with_mat1, &base_col, &[]));
 
         // Test 4: Two columns without materialized (None) should be equivalent
         let base_col2 = base_col.clone();
-        assert!(columns_are_equivalent(&base_col, &base_col2));
+        assert!(columns_are_equivalent(&base_col, &base_col2, &[]));
 
         // Test 5: Adding materialized to a column should be detected as a change
         let col_before = Column {
             materialized: None,
+            alias: None,
             ..base_col.clone()
         };
         let col_after = Column {
             materialized: Some("cityHash64(user_id)".to_string()),
             ..base_col.clone()
         };
-        assert!(!columns_are_equivalent(&col_before, &col_after));
+        assert!(!columns_are_equivalent(&col_before, &col_after, &[]));
 
         // Test 6: Removing materialized from a column should be detected as a change
         let col_with_mat = Column {
@@ -5967,9 +6270,14 @@ mod diff_tests {
         };
         let col_without_mat = Column {
             materialized: None,
+            alias: None,
             ..base_col.clone()
         };
-        assert!(!columns_are_equivalent(&col_with_mat, &col_without_mat));
+        assert!(!columns_are_equivalent(
+            &col_with_mat,
+            &col_without_mat,
+            &[]
+        ));
     }
 
     #[test]
@@ -5994,6 +6302,7 @@ mod diff_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         });
 
         map1.tables
@@ -6353,6 +6662,7 @@ mod diff_topic_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             }],
             metadata: None,
             life_cycle: LifeCycle::FullyManaged,
@@ -6646,6 +6956,7 @@ mod diff_topic_to_table_sync_process_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             }],
             version: Some(version.clone()),
             source_primitive: PrimitiveSignature {
@@ -6771,6 +7082,7 @@ mod diff_topic_to_table_sync_process_tests {
             ttl: None,
             codec: None,
             materialized: None,
+            alias: None,
         }];
 
         assert_eq!(
@@ -7004,6 +7316,7 @@ mod diff_function_process_tests {
                 primitive_type: PrimitiveTypes::Function,
             },
             metadata: None,
+            dead_letter_queue_topic_id: None,
         }
     }
 
@@ -7325,6 +7638,7 @@ mod diff_orchestration_worker_tests {
             engine_params_hash: None,
             table_settings_hash: None,
             indexes: vec![],
+            projections: vec![],
             metadata: None,
             source_primitive: PrimitiveSignature {
                 name: "s3queue_test".to_string(),
@@ -7332,6 +7646,7 @@ mod diff_orchestration_worker_tests {
             },
             life_cycle: LifeCycle::FullyManaged,
             database: None,
+            seed_filter: Default::default(),
         };
 
         let mut kafka_settings = std::collections::HashMap::new();
@@ -7359,6 +7674,7 @@ mod diff_orchestration_worker_tests {
             engine_params_hash: None,
             table_settings_hash: None,
             indexes: vec![],
+            projections: vec![],
             metadata: None,
             source_primitive: PrimitiveSignature {
                 name: "kafka_test".to_string(),
@@ -7366,6 +7682,7 @@ mod diff_orchestration_worker_tests {
             },
             life_cycle: LifeCycle::FullyManaged,
             database: None,
+            seed_filter: Default::default(),
         };
 
         map.tables.insert("s3queue_test".to_string(), s3queue_table);
@@ -7392,8 +7709,180 @@ mod diff_orchestration_worker_tests {
         assert_eq!(settings.get("kafka_sasl_username").unwrap(), "[HIDDEN]");
         assert_eq!(settings.get("kafka_num_consumers").unwrap(), "2");
     }
-}
 
+    #[test]
+    fn test_ignore_string_low_cardinality_differences_integration() {
+        use crate::framework::core::infrastructure::table::{
+            Column, ColumnType, IntType, OrderBy, Table,
+        };
+        use crate::framework::core::partial_infrastructure_map::LifeCycle;
+        use crate::framework::versions::Version;
+        use crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine;
+        use crate::infrastructure::olap::clickhouse::IgnorableOperation;
+
+        let table_with_low_cardinality = Table {
+            name: "test_table".to_string(),
+            database: None,
+            cluster_name: None,
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![("LowCardinality".to_string(), serde_json::json!(true))],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "name".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: Some(Version::from_string("1.0.0".to_string())),
+            source_primitive: PrimitiveSignature {
+                name: "test".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        };
+
+        let table_without_low_cardinality = Table {
+            name: "test_table".to_string(),
+            database: None,
+            cluster_name: None,
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "name".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: Some(Version::from_string("1.0.0".to_string())),
+            source_primitive: PrimitiveSignature {
+                name: "test".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        };
+
+        // Test 1: Without ignore flag, should detect difference
+        let diff_without_ignore = compute_table_columns_diff(
+            &table_with_low_cardinality,
+            &table_without_low_cardinality,
+            &[],
+        );
+        assert_eq!(
+            diff_without_ignore.len(),
+            1,
+            "Expected one column change without ignore flag"
+        );
+
+        // Test 2: With ignore flag, should detect no difference
+        let ignore_ops = vec![IgnorableOperation::IgnoreStringLowCardinalityDifferences];
+        let diff_with_ignore = compute_table_columns_diff(
+            &table_with_low_cardinality,
+            &table_without_low_cardinality,
+            &ignore_ops,
+        );
+        assert_eq!(
+            diff_with_ignore.len(),
+            0,
+            "Expected no column changes with ignore flag"
+        );
+
+        // Test 3: Test with columns_are_equivalent directly
+        assert!(!columns_are_equivalent(
+            &table_with_low_cardinality.columns[0],
+            &table_without_low_cardinality.columns[0],
+            &[]
+        ));
+        assert!(columns_are_equivalent(
+            &table_with_low_cardinality.columns[0],
+            &table_without_low_cardinality.columns[0],
+            &ignore_ops
+        ));
+
+        // Test 4: Ensure other differences are still detected
+        let mut table_with_different_type = table_without_low_cardinality.clone();
+        table_with_different_type.columns[0].data_type = ColumnType::Int(IntType::Int64);
+
+        let diff_different_type = compute_table_columns_diff(
+            &table_with_low_cardinality,
+            &table_with_different_type,
+            &ignore_ops,
+        );
+        assert_eq!(
+            diff_different_type.len(),
+            1,
+            "Should still detect actual type differences even with ignore flag"
+        );
+    }
+}
 #[cfg(test)]
 mod normalize_tests {
     use super::*;
@@ -7702,10 +8191,22 @@ mod normalize_tests {
 #[cfg(test)]
 mod diff_workflow_tests {
     use super::*;
+    use crate::framework::core::infrastructure::InfrastructureSignature;
     use crate::framework::languages::SupportedLanguages;
     use crate::framework::scripts::Workflow;
 
     fn create_test_workflow(name: &str, schedule: &str, retries: u32, timeout: &str) -> Workflow {
+        create_test_workflow_with_lineage(name, schedule, retries, timeout, vec![], vec![])
+    }
+
+    fn create_test_workflow_with_lineage(
+        name: &str,
+        schedule: &str,
+        retries: u32,
+        timeout: &str,
+        pulls_data_from: Vec<InfrastructureSignature>,
+        pushes_data_to: Vec<InfrastructureSignature>,
+    ) -> Workflow {
         Workflow::from_user_code(
             name.to_string(),
             SupportedLanguages::Typescript,
@@ -7716,8 +8217,9 @@ mod diff_workflow_tests {
             } else {
                 Some(schedule.to_string())
             },
+            pulls_data_from,
+            pushes_data_to,
         )
-        .unwrap()
     }
 
     #[test]
@@ -7853,6 +8355,120 @@ mod diff_workflow_tests {
     }
 
     #[test]
+    fn test_workflow_lineage_order_change_does_not_trigger_update() {
+        let mut current: HashMap<String, Workflow> = HashMap::new();
+        let mut target: HashMap<String, Workflow> = HashMap::new();
+
+        let workflow_v1 = create_test_workflow_with_lineage(
+            "my_workflow",
+            "1h",
+            3,
+            "30s",
+            vec![
+                InfrastructureSignature::Table {
+                    id: "Orders".to_string(),
+                },
+                InfrastructureSignature::Topic {
+                    id: "OrdersTopic".to_string(),
+                },
+            ],
+            vec![
+                InfrastructureSignature::Topic {
+                    id: "OrdersEvents".to_string(),
+                },
+                InfrastructureSignature::ApiEndpoint {
+                    id: "OrdersSink".to_string(),
+                },
+            ],
+        );
+        let workflow_v2 = create_test_workflow_with_lineage(
+            "my_workflow",
+            "1h",
+            3,
+            "30s",
+            vec![
+                InfrastructureSignature::Topic {
+                    id: "OrdersTopic".to_string(),
+                },
+                InfrastructureSignature::Table {
+                    id: "Orders".to_string(),
+                },
+            ],
+            vec![
+                InfrastructureSignature::ApiEndpoint {
+                    id: "OrdersSink".to_string(),
+                },
+                InfrastructureSignature::Topic {
+                    id: "OrdersEvents".to_string(),
+                },
+            ],
+        );
+
+        current.insert("my_workflow".to_string(), workflow_v1);
+        target.insert("my_workflow".to_string(), workflow_v2);
+
+        let mut changes = vec![];
+        InfrastructureMap::diff_workflows(&current, &target, &mut changes);
+
+        assert!(
+            changes.is_empty(),
+            "No changes expected when only workflow lineage ordering changes"
+        );
+    }
+
+    #[test]
+    fn test_workflow_lineage_change_triggers_update() {
+        let mut current: HashMap<String, Workflow> = HashMap::new();
+        let mut target: HashMap<String, Workflow> = HashMap::new();
+
+        let workflow_v1 = create_test_workflow_with_lineage(
+            "my_workflow",
+            "1h",
+            3,
+            "30s",
+            vec![InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            }],
+            vec![],
+        );
+        let workflow_v2 = create_test_workflow_with_lineage(
+            "my_workflow",
+            "1h",
+            3,
+            "30s",
+            vec![InfrastructureSignature::Table {
+                id: "OrdersV2".to_string(),
+            }],
+            vec![],
+        );
+
+        current.insert("my_workflow".to_string(), workflow_v1);
+        target.insert("my_workflow".to_string(), workflow_v2);
+
+        let mut changes = vec![];
+        InfrastructureMap::diff_workflows(&current, &target, &mut changes);
+
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            WorkflowChange::Workflow(Change::Updated { before, after }) => {
+                assert_eq!(
+                    before.pulls_data_from(),
+                    &[InfrastructureSignature::Table {
+                        id: "Orders".to_string()
+                    }]
+                );
+                assert_eq!(
+                    after.pulls_data_from(),
+                    &[InfrastructureSignature::Table {
+                        id: "OrdersV2".to_string()
+                    }]
+                );
+            }
+            _ => panic!("Expected Updated change"),
+        }
+    }
+
+    #[test]
     fn test_workflow_schedule_added_triggers_update() {
         let mut current: HashMap<String, Workflow> = HashMap::new();
         let mut target: HashMap<String, Workflow> = HashMap::new();
@@ -7962,6 +8578,66 @@ mod version_tests {
     }
 
     #[test]
+    fn test_proto_roundtrip_select_row_policies() {
+        use crate::framework::core::infrastructure::select_row_policy::{
+            SelectRowPolicy, TableReference,
+        };
+
+        let mut map = InfrastructureMap::default();
+        map.select_row_policies.insert(
+            "tenant_isolation".to_string(),
+            SelectRowPolicy {
+                name: "tenant_isolation".to_string(),
+                tables: vec![
+                    TableReference {
+                        name: "events_1_0_0".to_string(),
+                        database: None,
+                    },
+                    TableReference {
+                        name: "orders_1_0_0".to_string(),
+                        database: None,
+                    },
+                ],
+                column: "org_id".to_string(),
+                claim: "org_id".to_string(),
+            },
+        );
+        map.select_row_policies.insert(
+            "region_filter".to_string(),
+            SelectRowPolicy {
+                name: "region_filter".to_string(),
+                tables: vec![TableReference {
+                    name: "events_1_0_0".to_string(),
+                    database: None,
+                }],
+                column: "region".to_string(),
+                claim: "region".to_string(),
+            },
+        );
+
+        let bytes = map.to_proto_bytes();
+        let decoded = InfrastructureMap::from_proto(bytes).unwrap();
+
+        assert_eq!(decoded.select_row_policies.len(), 2);
+
+        let tenant = decoded.select_row_policies.get("tenant_isolation").unwrap();
+        assert_eq!(tenant.name, "tenant_isolation");
+        assert_eq!(tenant.tables.len(), 2);
+        assert_eq!(tenant.tables[0].name, "events_1_0_0");
+        assert_eq!(tenant.tables[0].database, None);
+        assert_eq!(tenant.tables[1].name, "orders_1_0_0");
+        assert_eq!(tenant.column, "org_id");
+        assert_eq!(tenant.claim, "org_id");
+
+        let region = decoded.select_row_policies.get("region_filter").unwrap();
+        assert_eq!(region.name, "region_filter");
+        assert_eq!(region.tables.len(), 1);
+        assert_eq!(region.tables[0].name, "events_1_0_0");
+        assert_eq!(region.column, "region");
+        assert_eq!(region.claim, "region");
+    }
+
+    #[test]
     fn test_backward_compatibility_json() {
         let old_json = r#"{
             "default_database": "test_db",
@@ -8035,6 +8711,7 @@ mod mirrorable_external_tables_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             }],
             order_by: OrderBy::Fields(vec!["id".to_string()]),
             partition_by: None,
@@ -8050,10 +8727,12 @@ mod mirrorable_external_tables_tests {
             table_settings_hash: None,
             table_settings: None,
             indexes: vec![],
+            projections: vec![],
             database: None,
             table_ttl_setting: None,
             cluster_name: None,
             primary_key_expression: None,
+            seed_filter: Default::default(),
         };
 
         // 2. ExternallyManaged table with Kafka engine (write-only) - should NOT be returned
@@ -8077,6 +8756,7 @@ mod mirrorable_external_tables_tests {
                 ttl: None,
                 codec: None,
                 materialized: None,
+                alias: None,
             }],
             order_by: OrderBy::Fields(vec![]),
             partition_by: None,
@@ -8092,10 +8772,12 @@ mod mirrorable_external_tables_tests {
             table_settings_hash: None,
             table_settings: None,
             indexes: vec![],
+            projections: vec![],
             database: None,
             table_ttl_setting: None,
             cluster_name: None,
             primary_key_expression: None,
+            seed_filter: Default::default(),
         };
 
         // 3. FullyManaged table with MergeTree (supports SELECT but wrong lifecycle) - should NOT be returned
@@ -8142,5 +8824,268 @@ mod mirrorable_external_tables_tests {
             !mirrorable.iter().any(|t| t.name == "managed_mergetree"),
             "FullyManaged table should not be mirrorable (wrong lifecycle)"
         );
+    }
+}
+
+#[cfg(test)]
+mod lineage_diff_equality_tests {
+    use super::*;
+    use crate::framework::core::infrastructure::api_endpoint::{APIType, ApiEndpoint, Method};
+    use crate::framework::core::infrastructure::table::{Metadata, SourceLocation};
+    use crate::framework::core::infrastructure::web_app::WebApp;
+    use crate::framework::core::infrastructure::InfrastructureSignature;
+
+    fn test_api_endpoint() -> ApiEndpoint {
+        ApiEndpoint {
+            name: "lineage_api".to_string(),
+            api_type: APIType::EGRESS {
+                query_params: vec![],
+                output_schema: serde_json::Value::Null,
+            },
+            path: std::path::PathBuf::from("lineage_api"),
+            method: Method::GET,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "lineage_api".to_string(),
+                primitive_type: PrimitiveTypes::ConsumptionAPI,
+            },
+            metadata: Some(Metadata {
+                description: Some("before".to_string()),
+                source: Some(SourceLocation {
+                    file: "app/api.ts".to_string(),
+                }),
+            }),
+            pulls_data_from: vec![InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            }],
+            pushes_data_to: vec![],
+        }
+    }
+
+    fn test_web_app() -> WebApp {
+        WebApp {
+            name: "lineage_web".to_string(),
+            mount_path: "/lineage".to_string(),
+            metadata: Some(
+                crate::framework::core::infrastructure::web_app::WebAppMetadata {
+                    description: Some("before".to_string()),
+                },
+            ),
+            pulls_data_from: vec![InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            }],
+            pushes_data_to: vec![],
+        }
+    }
+
+    #[test]
+    fn api_endpoint_equality_ignores_metadata_but_tracks_lineage() {
+        let base = test_api_endpoint();
+
+        let mut metadata_only = base.clone();
+        metadata_only.metadata = Some(Metadata {
+            description: Some("after".to_string()),
+            source: Some(SourceLocation {
+                file: "app/other.ts".to_string(),
+            }),
+        });
+        assert!(
+            api_endpoints_equal_ignore_metadata(&base, &metadata_only),
+            "Metadata-only changes should be ignored for API endpoint diffs"
+        );
+
+        let mut lineage_changed = base.clone();
+        lineage_changed.pulls_data_from = vec![InfrastructureSignature::Table {
+            id: "OrdersV2".to_string(),
+        }];
+        assert!(
+            !api_endpoints_equal_ignore_metadata(&base, &lineage_changed),
+            "Lineage changes should be treated as API endpoint updates"
+        );
+    }
+
+    #[test]
+    fn api_endpoint_equality_ignores_lineage_order() {
+        let mut base = test_api_endpoint();
+        base.pulls_data_from = vec![
+            InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            },
+            InfrastructureSignature::Topic {
+                id: "OrdersTopic".to_string(),
+            },
+        ];
+        base.pushes_data_to = vec![
+            InfrastructureSignature::Topic {
+                id: "OrdersEvents".to_string(),
+            },
+            InfrastructureSignature::ApiEndpoint {
+                id: "AnalyticsSink".to_string(),
+            },
+        ];
+
+        let mut reordered = base.clone();
+        reordered.pulls_data_from.reverse();
+        reordered.pushes_data_to.reverse();
+
+        assert!(
+            api_endpoints_equal_ignore_metadata(&base, &reordered),
+            "Lineage ordering should not affect API endpoint diff equality"
+        );
+    }
+
+    #[test]
+    fn web_app_equality_ignores_metadata_but_tracks_lineage() {
+        let base = test_web_app();
+
+        let mut metadata_only = base.clone();
+        metadata_only.metadata = Some(
+            crate::framework::core::infrastructure::web_app::WebAppMetadata {
+                description: Some("after".to_string()),
+            },
+        );
+        assert!(
+            web_apps_equal_ignore_metadata(&base, &metadata_only),
+            "Metadata-only changes should be ignored for WebApp diffs"
+        );
+
+        let mut lineage_changed = base.clone();
+        lineage_changed.pushes_data_to = vec![InfrastructureSignature::Topic {
+            id: "OrdersEvents".to_string(),
+        }];
+        assert!(
+            !web_apps_equal_ignore_metadata(&base, &lineage_changed),
+            "Lineage changes should be treated as WebApp updates"
+        );
+    }
+
+    #[test]
+    fn web_app_equality_ignores_lineage_order() {
+        let mut base = test_web_app();
+        base.pulls_data_from = vec![
+            InfrastructureSignature::Table {
+                id: "Orders".to_string(),
+            },
+            InfrastructureSignature::Topic {
+                id: "OrdersTopic".to_string(),
+            },
+        ];
+        base.pushes_data_to = vec![
+            InfrastructureSignature::Topic {
+                id: "OrdersEvents".to_string(),
+            },
+            InfrastructureSignature::ApiEndpoint {
+                id: "WebhookSink".to_string(),
+            },
+        ];
+
+        let mut reordered = base.clone();
+        reordered.pulls_data_from.reverse();
+        reordered.pushes_data_to.reverse();
+
+        assert!(
+            web_apps_equal_ignore_metadata(&base, &reordered),
+            "Lineage ordering should not affect WebApp diff equality"
+        );
+    }
+}
+
+#[cfg(test)]
+mod diff_select_row_policy_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn create_test_row_policy(
+        name: &str,
+        tables: Vec<&str>,
+        column: &str,
+        claim: &str,
+    ) -> crate::framework::core::infrastructure::select_row_policy::SelectRowPolicy {
+        use crate::framework::core::infrastructure::table::TableReference;
+        crate::framework::core::infrastructure::select_row_policy::SelectRowPolicy {
+            name: name.to_string(),
+            tables: tables
+                .into_iter()
+                .map(|t| TableReference {
+                    name: t.to_string(),
+                    database: None,
+                })
+                .collect(),
+            column: column.to_string(),
+            claim: claim.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_diff_select_row_policy_no_changes() {
+        let policy = create_test_row_policy("tenant_iso", vec!["events"], "org_id", "org_id");
+        let mut policies = HashMap::new();
+        policies.insert("tenant_iso".to_string(), policy);
+
+        let mut changes = vec![];
+        InfrastructureMap::diff_select_row_policies(&policies, &policies, &mut changes);
+        assert!(
+            changes.is_empty(),
+            "Expected no changes for identical policies"
+        );
+    }
+
+    #[test]
+    fn test_diff_select_row_policy_add() {
+        let policy = create_test_row_policy("tenant_iso", vec!["events"], "org_id", "org_id");
+        let mut target = HashMap::new();
+        target.insert("tenant_iso".to_string(), policy.clone());
+
+        let mut changes = vec![];
+        InfrastructureMap::diff_select_row_policies(&HashMap::new(), &target, &mut changes);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            OlapChange::SelectRowPolicy(Change::Added(p)) => {
+                assert_eq!(**p, policy);
+            }
+            _ => panic!("Expected SelectRowPolicy Added"),
+        }
+    }
+
+    #[test]
+    fn test_diff_select_row_policy_remove() {
+        let policy = create_test_row_policy("tenant_iso", vec!["events"], "org_id", "org_id");
+        let mut current = HashMap::new();
+        current.insert("tenant_iso".to_string(), policy.clone());
+
+        let mut changes = vec![];
+        InfrastructureMap::diff_select_row_policies(&current, &HashMap::new(), &mut changes);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            OlapChange::SelectRowPolicy(Change::Removed(p)) => {
+                assert_eq!(**p, policy);
+            }
+            _ => panic!("Expected SelectRowPolicy Removed"),
+        }
+    }
+
+    #[test]
+    fn test_diff_select_row_policy_update() {
+        let before = create_test_row_policy("tenant_iso", vec!["events"], "org_id", "org_id");
+        let after =
+            create_test_row_policy("tenant_iso", vec!["events", "logs"], "org_id", "org_id");
+        let mut current = HashMap::new();
+        current.insert("tenant_iso".to_string(), before.clone());
+        let mut target = HashMap::new();
+        target.insert("tenant_iso".to_string(), after.clone());
+
+        let mut changes = vec![];
+        InfrastructureMap::diff_select_row_policies(&current, &target, &mut changes);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            OlapChange::SelectRowPolicy(Change::Updated {
+                before: b,
+                after: a,
+            }) => {
+                assert_eq!(**b, before);
+                assert_eq!(**a, after);
+            }
+            _ => panic!("Expected SelectRowPolicy Updated"),
+        }
     }
 }
