@@ -1,13 +1,6 @@
 import type { Plugin } from "esbuild";
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  writeFileSync,
-} from "fs";
-import { resolve, basename, join } from "path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { basename, join, resolve } from "path";
 import { defineConfig, type Options } from "tsup";
 
 /**
@@ -35,9 +28,7 @@ const stubNativeModules: Plugin = {
       "redis",
     ];
 
-    const filter = new RegExp(
-      `^(${nativeModules.map((m) => m.replace("/", "\\/")).join("|")})$`,
-    );
+    const filter = new RegExp(`^(${nativeModules.map((m) => m.replace("/", "\\/")).join("|")})$`);
 
     build.onResolve({ filter }, (args) => ({
       path: args.path,
@@ -98,58 +89,55 @@ const patchedCompilerPlugin: Plugin = {
   name: "patched-compiler-plugin",
   setup(build) {
     // Intercept our stub compilerPlugin.ts and replace it with the patched upstream
-    build.onLoad(
-      { filter: /moose-lib-serverless\/src\/compilerPlugin\.ts$/ },
-      () => {
-        // Read the upstream compiled compiler plugin
-        const upstreamPath = resolve(
-          __dirname,
-          "node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
-        );
-        let contents = readFileSync(upstreamPath, "utf8");
+    build.onLoad({ filter: /moose-lib-serverless\/src\/compilerPlugin\.ts$/ }, () => {
+      // Read the upstream compiled compiler plugin
+      const upstreamPath = resolve(
+        __dirname,
+        "node_modules/@514labs/moose-lib/dist/compilerPlugin.js",
+      );
+      let contents = readFileSync(upstreamPath, "utf8");
 
-        // Patch isMooseFile to recognize our package
-        contents = contents.replace(
-          'location.includes("@514labs/moose-lib")',
-          'location.includes("@514labs/moose-lib") || location.includes("@bayoudhi/moose-lib-serverless")',
-        );
+      // Patch isMooseFile to recognize our package
+      contents = contents.replace(
+        'location.includes("@514labs/moose-lib")',
+        'location.includes("@514labs/moose-lib") || location.includes("@bayoudhi/moose-lib-serverless")',
+      );
 
-        // Patch createTransformer to use ts-patch's host TypeScript instance.
-        //
-        // The upstream plugin does `require("typescript")` 7 times, producing
-        // import_typescript, import_typescript2, ..., import_typescript7. In pnpm
-        // workspaces these can resolve to a DIFFERENT TypeScript version than the
-        // one ts-patch loaded, causing SyntaxKind enum mismatches and silent
-        // transformation failures ("Supply the type param T").
-        //
-        // ts-patch passes `TransformerExtras { ts: typeof ts }` as the third
-        // argument to the plugin factory (named `_extrasOrConfig` in the compiled
-        // output). We inject code right after the `maybeProgramExtras` guard to
-        // reassign all import_typescript* variables to use `_extrasOrConfig.ts`
-        // — the exact TypeScript instance ts-patch is using.
-        contents = contents.replace(
+      // Patch createTransformer to use ts-patch's host TypeScript instance.
+      //
+      // The upstream plugin does `require("typescript")` 7 times, producing
+      // import_typescript, import_typescript2, ..., import_typescript7. In pnpm
+      // workspaces these can resolve to a DIFFERENT TypeScript version than the
+      // one ts-patch loaded, causing SyntaxKind enum mismatches and silent
+      // transformation failures ("Supply the type param T").
+      //
+      // ts-patch passes `TransformerExtras { ts: typeof ts }` as the third
+      // argument to the plugin factory (named `_extrasOrConfig` in the compiled
+      // output). We inject code right after the `maybeProgramExtras` guard to
+      // reassign all import_typescript* variables to use `_extrasOrConfig.ts`
+      // — the exact TypeScript instance ts-patch is using.
+      contents = contents.replace(
+        "const transformFunction = transform2(program.getTypeChecker(), program);",
+        [
+          "// [moose-lib-serverless] Use ts-patch's host TypeScript instance",
+          "// to avoid version mismatches in pnpm workspaces.",
+          "if (_extrasOrConfig && _extrasOrConfig.ts) {",
+          "  var _hostTs = { default: _extrasOrConfig.ts, __esModule: true };",
+          "  Object.keys(_extrasOrConfig.ts).forEach(function(k) { _hostTs[k] = _extrasOrConfig.ts[k]; });",
+          "  import_typescript = _hostTs;",
+          "  import_typescript2 = _hostTs;",
+          "  import_typescript3 = _hostTs;",
+          "  import_typescript4 = _hostTs;",
+          "  import_typescript5 = _hostTs;",
+          "  import_typescript6 = _hostTs;",
+          "  import_typescript7 = _hostTs;",
+          "}",
           "const transformFunction = transform2(program.getTypeChecker(), program);",
-          [
-            "// [moose-lib-serverless] Use ts-patch's host TypeScript instance",
-            "// to avoid version mismatches in pnpm workspaces.",
-            "if (_extrasOrConfig && _extrasOrConfig.ts) {",
-            "  var _hostTs = { default: _extrasOrConfig.ts, __esModule: true };",
-            "  Object.keys(_extrasOrConfig.ts).forEach(function(k) { _hostTs[k] = _extrasOrConfig.ts[k]; });",
-            "  import_typescript = _hostTs;",
-            "  import_typescript2 = _hostTs;",
-            "  import_typescript3 = _hostTs;",
-            "  import_typescript4 = _hostTs;",
-            "  import_typescript5 = _hostTs;",
-            "  import_typescript6 = _hostTs;",
-            "  import_typescript7 = _hostTs;",
-            "}",
-            "const transformFunction = transform2(program.getTypeChecker(), program);",
-          ].join("\n"),
-        );
+        ].join("\n"),
+      );
 
-        return { contents, loader: "js" };
-      },
-    );
+      return { contents, loader: "js" };
+    });
   },
 };
 
@@ -166,57 +154,45 @@ const patchedCompilerPlugin: Plugin = {
 const patchedMooseTspc: Plugin = {
   name: "patched-moose-tspc",
   setup(build) {
-    build.onLoad(
-      { filter: /moose-lib-serverless\/src\/moose-tspc\.ts$/ },
-      () => {
-        const upstreamPath = resolve(
-          __dirname,
-          "node_modules/@514labs/moose-lib/dist/moose-tspc.js",
-        );
-        let contents = readFileSync(upstreamPath, "utf8");
+    build.onLoad({ filter: /moose-lib-serverless\/src\/moose-tspc\.ts$/ }, () => {
+      const upstreamPath = resolve(__dirname, "node_modules/@514labs/moose-lib/dist/moose-tspc.js");
+      let contents = readFileSync(upstreamPath, "utf8");
 
-        // Strip the upstream shebang — tsup's banner config adds our own
-        contents = contents.replace(/^#!.*\n/, "");
+      // Strip the upstream shebang — tsup's banner config adds our own
+      contents = contents.replace(/^#!.*\n/, "");
 
-        // Patch the compiler plugin path to use require.resolve() so it works
-        // in monorepos with hoisted node_modules (where ./node_modules/... fails)
-        contents = contents.replace(
-          '"./node_modules/@514labs/moose-lib/dist/compilerPlugin.js"',
-          'require.resolve("@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js")',
-        );
+      // Patch the compiler plugin path to use require.resolve() so it works
+      // in monorepos with hoisted node_modules (where ./node_modules/... fails)
+      contents = contents.replace(
+        '"./node_modules/@514labs/moose-lib/dist/compilerPlugin.js"',
+        'require.resolve("@bayoudhi/moose-lib-serverless/dist/compilerPlugin.js")',
+      );
 
-        // Patch npx tspc invocations to use direct node + resolved tspc path.
-        // In pnpm workspaces, `npx tspc` fails because pnpm's strict hoisting
-        // doesn't place tspc where npx expects it. Instead, we:
-        //   1. Replace "npx" with process.execPath (current node binary)
-        //   2. Replace "tspc" (first arg) with require.resolve("ts-patch/bin/tspc.js")
-        // This makes invocations: node /resolved/path/to/tspc.js -p tsconfig ...
-        contents = contents.replaceAll(
-          '"tspc",',
-          'require.resolve("ts-patch/bin/tspc.js"),',
-        );
-        contents = contents.replace(
-          '(0, import_child_process.execFileSync)("npx",',
-          "(0, import_child_process.execFileSync)(process.execPath,",
-        );
-        contents = contents.replace(
-          '(0, import_child_process.spawn)("npx",',
-          "(0, import_child_process.spawn)(process.execPath,",
-        );
+      // Patch npx tspc invocations to use direct node + resolved tspc path.
+      // In pnpm workspaces, `npx tspc` fails because pnpm's strict hoisting
+      // doesn't place tspc where npx expects it. Instead, we:
+      //   1. Replace "npx" with process.execPath (current node binary)
+      //   2. Replace "tspc" (first arg) with require.resolve("ts-patch/bin/tspc.js")
+      // This makes invocations: node /resolved/path/to/tspc.js -p tsconfig ...
+      contents = contents.replaceAll('"tspc",', 'require.resolve("ts-patch/bin/tspc.js"),');
+      contents = contents.replace(
+        '(0, import_child_process.execFileSync)("npx",',
+        "(0, import_child_process.execFileSync)(process.execPath,",
+      );
+      contents = contents.replace(
+        '(0, import_child_process.spawn)("npx",',
+        "(0, import_child_process.spawn)(process.execPath,",
+      );
 
-        // Strip --sourceMap and --inlineSources CLI flags from tspcArgs.
-        // The upstream moose-tspc hardcodes these flags, but they conflict with
-        // projects that set inlineSourceMap: true in their tsconfig.json (TS5053).
-        // The user's tsconfig already specifies their preferred source map strategy,
-        // so moose-tspc shouldn't override it.
-        contents = contents.replace(
-          /\s*"--sourceMap",\s*"--inlineSources",?/g,
-          "",
-        );
+      // Strip --sourceMap and --inlineSources CLI flags from tspcArgs.
+      // The upstream moose-tspc hardcodes these flags, but they conflict with
+      // projects that set inlineSourceMap: true in their tsconfig.json (TS5053).
+      // The user's tsconfig already specifies their preferred source map strategy,
+      // so moose-tspc shouldn't override it.
+      contents = contents.replace(/\s*"--sourceMap",\s*"--inlineSources",?/g, "");
 
-        return { contents, loader: "js" };
-      },
-    );
+      return { contents, loader: "js" };
+    });
   },
 };
 /**
@@ -238,68 +214,57 @@ const patchedMooseTspc: Plugin = {
 const patchedMooseRunner: Plugin = {
   name: "patched-moose-runner",
   setup(build) {
-    build.onLoad(
-      { filter: /moose-lib-serverless\/src\/moose-runner\.ts$/ },
-      () => {
-        const upstreamPath = resolve(
-          __dirname,
-          "node_modules/@514labs/moose-lib/dist/moose-runner.js",
-        );
-        let contents = readFileSync(upstreamPath, "utf8");
+    build.onLoad({ filter: /moose-lib-serverless\/src\/moose-runner\.ts$/ }, () => {
+      const upstreamPath = resolve(
+        __dirname,
+        "node_modules/@514labs/moose-lib/dist/moose-runner.js",
+      );
+      let contents = readFileSync(upstreamPath, "utf8");
 
-        // Strip the upstream shebang — tsup's banner config adds our own
-        contents = contents.replace(/^#!.*\n/, "");
+      // Strip the upstream shebang — tsup's banner config adds our own
+      contents = contents.replace(/^#!.*\n/, "");
 
-        // Patch the print-version command to detect the installed CLI version
-        // at runtime instead of reading a hardcoded package.json version.
-        // The CLI runs `moose-runner print-version` and does a strict equality
-        // check against its own CLI_VERSION. By running `moose --version` and
-        // echoing the result, we always match whatever CLI is installed.
-        // Falls back to the upstream moose-lib version if detection fails.
-        const upstreamPkgPath = resolve(
-          __dirname,
-          "node_modules/@514labs/moose-lib/package.json",
-        );
-        const upstreamVersion = JSON.parse(
-          readFileSync(upstreamPkgPath, "utf8"),
-        ).version;
+      // Patch the print-version command to detect the installed CLI version
+      // at runtime instead of reading a hardcoded package.json version.
+      // The CLI runs `moose-runner print-version` and does a strict equality
+      // check against its own CLI_VERSION. By running `moose --version` and
+      // echoing the result, we always match whatever CLI is installed.
+      // Falls back to the upstream moose-lib version if detection fails.
+      const upstreamPkgPath = resolve(__dirname, "node_modules/@514labs/moose-lib/package.json");
+      const upstreamVersion = JSON.parse(readFileSync(upstreamPkgPath, "utf8")).version;
 
-        contents = contents.replace(
-          /var packageJson = JSON\.parse\(\n\s*\(0, import_fs2\.readFileSync\)\(\(0, import_path2\.join\)\(__dirname, "\.\.", "package\.json"\), "utf-8"\)\n\);/,
-          `var packageJson = { version: "${upstreamVersion}" };`,
-        );
+      contents = contents.replace(
+        /var packageJson = JSON\.parse\(\n\s*\(0, import_fs2\.readFileSync\)\(\(0, import_path2\.join\)\(__dirname, "\.\.", "package\.json"\), "utf-8"\)\n\);/,
+        `var packageJson = { version: "${upstreamVersion}" };`,
+      );
 
-        // Replace the print-version action to detect CLI version at runtime.
-        // Original: process.stdout.write(packageJson.version);
-        // Patched: try `moose --version`, parse output, echo that version.
-        contents = contents.replace(
-          "process.stdout.write(packageJson.version)",
-          [
-            "(function() {",
-            "  try {",
-            '    var out = require("child_process").execSync("moose --version", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();',
-            "    var match = out.match(/moose-cli\\s+(\\S+)/);",
-            "    process.stdout.write(match ? match[1] : packageJson.version);",
-            "  } catch(e) {",
-            "    process.stdout.write(packageJson.version);",
-            "  }",
-            "})()",
-          ].join("\n"),
-        );
+      // Replace the print-version action to detect CLI version at runtime.
+      // Original: process.stdout.write(packageJson.version);
+      // Patched: try `moose --version`, parse output, echo that version.
+      contents = contents.replace(
+        "process.stdout.write(packageJson.version)",
+        [
+          "(function() {",
+          "  try {",
+          '    var out = require("child_process").execSync("moose --version", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();',
+          "    var match = out.match(/moose-cli\\s+(\\S+)/);",
+          "    process.stdout.write(match ? match[1] : packageJson.version);",
+          "  } catch(e) {",
+          "    process.stdout.write(packageJson.version);",
+          "  }",
+          "})()",
+        ].join("\n"),
+      );
 
-        // resolveDir tells esbuild where to resolve bare require() calls
-        // found in the upstream content. Without it, esbuild can't resolve
-        // imports like commander from the virtual onLoad content.
-        return {
-          contents,
-          loader: "js",
-          resolveDir: resolve(
-            __dirname,
-            "node_modules/@514labs/moose-lib/dist",
-          ),
-        };
-      },
-    );
+      // resolveDir tells esbuild where to resolve bare require() calls
+      // found in the upstream content. Without it, esbuild can't resolve
+      // imports like commander from the virtual onLoad content.
+      return {
+        contents,
+        loader: "js",
+        resolveDir: resolve(__dirname, "node_modules/@514labs/moose-lib/dist"),
+      };
+    });
   },
 };
 
@@ -323,10 +288,7 @@ const patchedMooseRunner: Plugin = {
  * all .d.ts files live under @bayoudhi/moose-lib-serverless/dist/.
  */
 function copyUpstreamTypes(): void {
-  const upstreamDist = resolve(
-    __dirname,
-    "node_modules/@514labs/moose-lib/dist",
-  );
+  const upstreamDist = resolve(__dirname, "node_modules/@514labs/moose-lib/dist");
   const outDir = resolve(__dirname, "dist");
 
   if (!existsSync(outDir)) {
@@ -358,10 +320,7 @@ function copyUpstreamTypes(): void {
       "type Client = any;",
     );
     // Also remove bare `import '@temporalio/client'` if present
-    chunkContent = chunkContent.replace(
-      /^import '@temporalio\/client';\n?/m,
-      "",
-    );
+    chunkContent = chunkContent.replace(/^import '@temporalio\/client';\n?/m, "");
     writeFileSync(join(outDir, chunk), chunkContent, "utf8");
   }
 
@@ -374,12 +333,22 @@ function copyUpstreamTypes(): void {
   //      './browserCompatible.js' → './browserCompatible'
   indexDts = indexDts.replace(/'\.\/(.*?)\.js'/g, "'./$1'");
 
-  // Remove unavailable native module imports
-  indexDts = indexDts.replace(
-    /^import \{ KafkaJS \} from '@514labs\/kafka-javascript';\n/m,
-    "",
-  );
+  indexDts = indexDts.replace(/^import \{ KafkaJS \} from '@514labs\/kafka-javascript';\n/m, "");
   indexDts = indexDts.replace(/^import '@temporalio\/client';\n?/m, "");
+  indexDts = indexDts.replace(
+    /^import \{ z \} from 'zod';\n/m,
+    "declare namespace z { type ZodType = any; }\n",
+  );
+  indexDts = indexDts.replace(
+    /^import \{ McpServer \} from '@modelcontextprotocol\/sdk\/server\/mcp\.js';\n/m,
+    "type McpServer = any;\n",
+  );
+
+  // Stub McpServer (used by registerModelTools — serverless users don't need MCP)
+  indexDts = indexDts.replace(
+    /^import \{ McpServer \} from '@modelcontextprotocol\/sdk\/server\/mcp\.js';\n/m,
+    "type McpServer = any;\n",
+  );
 
   // Stub the Kafka and Producer types that referenced the removed import.
   // The upstream declares:
@@ -387,10 +356,7 @@ function copyUpstreamTypes(): void {
   //   type Kafka = KafkaJS.Kafka;
   //   type Producer = KafkaJS.Producer;
   // We replace with `any` stubs since serverless users don't use Kafka.
-  indexDts = indexDts.replace(
-    /^declare const Kafka:.*$/m,
-    "declare const Kafka: any;",
-  );
+  indexDts = indexDts.replace(/^declare const Kafka:.*$/m, "declare const Kafka: any;");
   indexDts = indexDts.replace(/^type Kafka = .*$/m, "type Kafka = any;");
   indexDts = indexDts.replace(/^type Producer = .*$/m, "type Producer = any;");
 
@@ -407,11 +373,11 @@ function copyUpstreamTypes(): void {
  * via {@link configureClickHouse} before calling \`.insert()\` on any table.
  */
 export interface ClickHouseConfig {
-  /** ClickHouse host (e.g. \"clickhouse.example.com\") */
+  /** ClickHouse host (e.g. "clickhouse.example.com") */
   host: string;
-  /** ClickHouse HTTP port as a string (e.g. \"8443\") */
+  /** ClickHouse HTTP port as a string (e.g. "8443") */
   port: string;
-  /** ClickHouse username (e.g. \"default\") */
+  /** ClickHouse username (e.g. "default") */
   username: string;
   /** ClickHouse password */
   password: string;
@@ -439,14 +405,8 @@ export declare function configureClickHouse(config: ClickHouseConfig): void;
   writeFileSync(join(outDir, "index.d.mts"), indexDts, "utf8");
 
   // Log what was copied for build visibility
-  const copiedFiles = [
-    ...chunkFiles,
-    "index.d.ts (patched)",
-    "index.d.mts (patched)",
-  ];
-  console.log(
-    `[copyUpstreamTypes] Copied ${copiedFiles.length} type declaration files:`,
-  );
+  const copiedFiles = [...chunkFiles, "index.d.ts (patched)", "index.d.mts (patched)"];
+  console.log(`[copyUpstreamTypes] Copied ${copiedFiles.length} type declaration files:`);
   copiedFiles.forEach((f) => console.log(`  - ${f}`));
 }
 
